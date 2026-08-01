@@ -68,6 +68,8 @@ public final class ChineseDriverNbt {
         t.putInt("currentTurnSeat", r.currentTurnSeat());
         t.putInt("claimFromSeat", r.claimFromSeat());
         t.putInt("lastDrawSeat", r.lastDrawSeat());
+        t.putInt("diceA", r.diceA());
+        t.putInt("diceB", r.diceB());
         t.putInt("wonCount", r.wonCount());
         t.putInt("drawsSoFar", r.drawsSoFar());
         t.putBoolean("anyDiscardYet", r.anyDiscardYet());
@@ -100,6 +102,7 @@ public final class ChineseDriverNbt {
                 t.getInt("currentTurnSeat"), t.getInt("claimFromSeat"),
                 t.contains("activeTile") ? MatchNbt.readTile(t.getCompound("activeTile")) : null,
                 t.contains("lastDrawSeat") ? t.getInt("lastDrawSeat") : -1,
+                t.getInt("diceA"), t.getInt("diceB"),   // legacy 存档无此字段 → 0，不跳牌
                 t.getInt("wonCount"), t.getInt("drawsSoFar"),
                 t.getBoolean("anyDiscardYet"), t.getBoolean("kanDiscardPending"),
                 t.getBoolean("lastDrawWasWallEnd"), t.getBoolean("lastDiscardWasWallEnd"),

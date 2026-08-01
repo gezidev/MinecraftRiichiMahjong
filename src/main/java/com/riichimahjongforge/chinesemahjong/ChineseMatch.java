@@ -50,8 +50,11 @@ public final class ChineseMatch {
         List<TheMahjongTile> wall = tileSet.createShuffledWall(random);
         List<Integer> start = new ArrayList<>();
         for (int i = 0; i < playerCount; i++) start.add(startingPoints);
-        currentRound = new ChineseRoundState(playerCount, 0, TheMahjongTile.Wind.EAST, 1, start, wall, rules);
+        currentRound = new ChineseRoundState(playerCount, 0, TheMahjongTile.Wind.EAST, 1, start, wall, rules,
+                rollDice(random), rollDice(random));
     }
+
+    private static int rollDice(Random random) { return 1 + random.nextInt(6); }
 
     /**
      * Archive the ended round and deal the next one. Dealer stays on a win when
@@ -79,7 +82,8 @@ public final class ChineseMatch {
         TheMahjongTile.Wind nextWind = TheMahjongTile.Wind.values()[windIdx];
 
         List<TheMahjongTile> wall = tileSet.createShuffledWall(random);
-        currentRound = new ChineseRoundState(playerCount, nextDealer, nextWind, nextHand, start, wall, rules);
+        currentRound = new ChineseRoundState(playerCount, nextDealer, nextWind, nextHand, start, wall, rules,
+                rollDice(random), rollDice(random));
         return true;
     }
 

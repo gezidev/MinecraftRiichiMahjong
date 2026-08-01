@@ -41,6 +41,9 @@ public final class ChineseRoundState {
     private int lastDrawSeat = -1;
     /** 变更计数：每次公开变更方法自增，供 driver 缓存 {@code legalActions}。 */
     private int version;
+    /** 开局两颗骰子（1-6）。0 = legacy/无骰（发牌不跳牌）。 */
+    private final int diceA;
+    private final int diceB;
 
     private final List<TheMahjongTile> wall;
     private final List<ChinesePlayerState> players;
@@ -59,26 +62,38 @@ public final class ChineseRoundState {
 
     public ChineseRoundState(int playerCount, int dealerSeat, TheMahjongTile.Wind roundWind,
                              int handNumber, List<Integer> startPoints,
-                             List<TheMahjongTile> wallIn, ChineseRules rules) {
+                             List<TheMahjongTile> wallIn, ChineseRules rules,
+                             int diceA, int diceB) {
         this.playerCount = playerCount;
         this.dealerSeat = dealerSeat;
         this.roundWind = roundWind;
         this.handNumber = handNumber;
         this.rules = rules;
+        this.diceA = diceA;
+        this.diceB = diceB;
         this.wall = new ArrayList<>();
         this.players = new ArrayList<>();
         for (int i = 0; i < playerCount; i++) players.add(new ChinesePlayerState(startPoints.get(i)));
 
+        // 真实开局：掷骰 → 定开门家 → 从开门处起跳发牌（回绕）。无骰（legacy）时从墙头顺序发。
+        int n = wallIn.size();
+        int breakTile = computeBreakTile(playerCount, dealerSeat, diceA, diceB, n);
+        int dealtCount = 13 * playerCount + 1;
         int pos = 0;
         for (int i = 0; i < 13; i++) {
-            for (int s = 0; s < playerCount; s++) players.get(s).draw(wallIn.get(pos++));
+            for (int s = 0; s < playerCount; s++) {
+                players.get(s).draw(wallIn.get((breakTile + pos) % n));
+                pos++;
+            }
         }
-        TheMahjongTile dealerExtra = wallIn.get(pos);
+        TheMahjongTile dealerExtra = wallIn.get((breakTile + pos) % n);
         players.get(dealerSeat).draw(dealerExtra); // 庄家多摸一张
         this.activeTile = dealerExtra;
         this.lastDrawSeat = dealerSeat;
         pos++;
-        for (; pos < wallIn.size(); pos++) this.wall.add(wallIn.get(pos)); // 余下为活牌墙
+        for (int i = 0; i < n - dealtCount; i++) {
+            this.wall.add(wallIn.get((breakTile + pos + i) % n)); // 余下为活牌墙，顺序连续回绕
+        }
         this.drawsSoFar = 1;
 
         if (rules.requireQueYiMen()) {
@@ -87,6 +102,20 @@ public final class ChineseRoundState {
             this.state = State.AWAITING_DISCARD;
             this.currentTurnSeat = dealerSeat;
         }
+    }
+
+    /**
+     * 开门位置（tile 索引，0-based，指向洗好的墙）：从庄家逆时针数 {@code diceA+diceB}
+     * 定开门家，再从开门家墙段右端（发牌方向）数 {@code diceA+diceB} 墩（2 张/墩）起跳。
+     * 纯函数、确定性，NBT 恢复一致。
+     */
+    private static int computeBreakTile(int playerCount, int dealerSeat, int diceA, int diceB, int n) {
+        if (diceA <= 0 || diceB <= 0) return 0; // legacy：不跳牌
+        int total = diceA + diceB;
+        int breaker = (dealerSeat + (total - 1)) % playerCount;
+        if (n % (playerCount * 2) != 0) return (total * 2) % n; // 每段不整除则回退
+        int stacksPerPlayer = n / (playerCount * 2);
+        return ((breaker + 1) * stacksPerPlayer * 2 - total * 2) % n;
     }
 
     // ── Getters ─────────────────────────────────────────────────────────
@@ -104,6 +133,21 @@ public final class ChineseRoundState {
     /** 最近一次摸牌座位；{@code lastDrawSeat()==seat && state()==AWAITING_DISCARD} 时
      *  {@code activeTile()} 才是该座位真正摸到的牌（供发牌/展示）。 */
     public int lastDrawSeat() { return lastDrawSeat; }
+
+    /** 开局骰子 A（1-6；0 = legacy）。 */
+    public int diceA() { return diceA; }
+    /** 开局骰子 B（1-6；0 = legacy）。 */
+    public int diceB() { return diceB; }
+    /** 开门家座位：从庄家起逆时针数 {@code diceA+diceB}（庄家=1）。无骰时返回庄家。 */
+    public int breakerSeat() {
+        if (diceA <= 0 || diceB <= 0) return dealerSeat;
+        return (dealerSeat + (diceA + diceB - 1)) % playerCount;
+    }
+    /** 该座位（相对庄家）的方位风。 */
+    public TheMahjongTile.Wind seatWind(int seat) {
+        int rel = ((seat - dealerSeat) % playerCount + playerCount) % playerCount;
+        return TheMahjongTile.Wind.values()[rel];
+    }
 
     /** 变更计数，供 {@link ChineseGameDriver} 缓存 legalActions。 */
     public int version() { return version; }
@@ -419,12 +463,13 @@ public final class ChineseRoundState {
             List<TheMahjongTile> wall, ChineseRules rules,
             List<ChinesePlayerState> players, State state, int currentTurnSeat,
             int claimFromSeat, TheMahjongTile activeTile, int lastDrawSeat,
+            int diceA, int diceB,
             int wonCount, int drawsSoFar,
             boolean anyDiscardYet, boolean kanDiscardPending,
             boolean lastDrawWasWallEnd, boolean lastDiscardWasWallEnd,
             List<ChineseWinResult> winResults) {
         ChineseRoundState r = new ChineseRoundState(playerCount, dealerSeat, roundWind,
-                handNumber, wall, rules, players);
+                handNumber, wall, rules, players, diceA, diceB);
         r.state = state;
         r.currentTurnSeat = currentTurnSeat;
         r.claimFromSeat = claimFromSeat;
@@ -443,7 +488,7 @@ public final class ChineseRoundState {
 
     private ChineseRoundState(int playerCount, int dealerSeat, TheMahjongTile.Wind roundWind,
                               int handNumber, List<TheMahjongTile> wall, ChineseRules rules,
-                              List<ChinesePlayerState> players) {
+                              List<ChinesePlayerState> players, int diceA, int diceB) {
         this.playerCount = playerCount;
         this.dealerSeat = dealerSeat;
         this.roundWind = roundWind;
@@ -451,6 +496,8 @@ public final class ChineseRoundState {
         this.rules = rules;
         this.wall = new ArrayList<>(wall);
         this.players = players;
+        this.diceA = diceA;
+        this.diceB = diceB;
         this.drawsSoFar = 1;
     }
 }

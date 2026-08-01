@@ -11,6 +11,7 @@ import com.riichimahjongforge.chinesemahjong.ChineseMatchPhase;
 import com.riichimahjongforge.chinesemahjong.ChinesePlayerInterface;
 import com.riichimahjongforge.chinesemahjong.ChineseRoundState;
 import com.riichimahjongforge.chinesemahjong.ChineseStupidActiveBot;
+import com.riichimahjongforge.chinesemahjong.ChineseWinResult;
 import com.riichimahjongforge.chinesemahjong.client.ChineseMahjongTableHumanPlayer;
 import com.riichimahjongforge.themahjongcompat.DriverNbt;
 import com.themahjong.TheMahjongMatch;
@@ -760,8 +761,8 @@ public class MahjongTableBlockEntity extends BlockEntity implements Container, M
 
     /** Chinese-regional tick: validate queues, advance the Chinese driver, then
      *  deliver/consume drawn tiles for human players (mirrors the riichi
-     *  {@link #serverTick} flow). Flips straight to AWAITING_ADVANCE on RoundEnded
-     *  (no staged reveal — the renderer reads the Chinese result payload directly). */
+     *  {@link #serverTick} flow). On RoundEnded runs the staged result reveal
+     *  (SHOW_HEADER → SHOW_YAKU_LINES → SHOW_FINAL → AWAITING_ADVANCE). */
     private void chineseServerTick() {
         if (!(level instanceof ServerLevel sl)) return;
         if (chineseDriver == null) return;
@@ -791,17 +792,76 @@ public class MahjongTableBlockEntity extends BlockEntity implements Container, M
         }
 
         if (animating) {
+            tickChineseResultAnimation(sl);
             if (playerStateChanged) markChangedAndSynced();
             return;
         }
         if (!(prevPhase instanceof ChineseMatchPhase.RoundEnded)
                 && nextPhase instanceof ChineseMatchPhase.RoundEnded) {
-            resultAnimStage = ResultAnimStage.AWAITING_ADVANCE;
-            markChangedAndSynced();
+            startChineseResultAnimation(sl);
         }
         if (prevPhase != nextPhase || playerStateChanged) {
             markChangedAndSynced();
         }
+    }
+
+    private void startChineseResultAnimation(ServerLevel sl) {
+        resultAnimStage = ResultAnimStage.SHOW_HEADER;
+        resultAnimYakuIdx = 0;
+        resultAnimNextTick = sl.getGameTime() + RESULT_ANIM_HEADER_TICKS;
+        playResultStepSound(sl);
+        markChangedAndSynced();
+    }
+
+    private void tickChineseResultAnimation(ServerLevel sl) {
+        if (resultAnimStage == ResultAnimStage.NONE) return;
+        if (!(chineseDriver.currentPhase() instanceof ChineseMatchPhase.RoundEnded re)) {
+            // Driver left RoundEnded behind us — clean up.
+            clearResultAnimState();
+            markChangedAndSynced();
+            return;
+        }
+        long now = sl.getGameTime();
+        if (now < resultAnimNextTick) return;
+        boolean changed = false;
+        switch (resultAnimStage) {
+            case SHOW_HEADER -> {
+                resultAnimStage = ResultAnimStage.SHOW_YAKU_LINES;
+                resultAnimNextTick = now + RESULT_ANIM_YAKU_TICKS;
+                changed = true;
+            }
+            case SHOW_YAKU_LINES -> {
+                int totalYaku = totalChineseYakuLineCount(re);
+                if (resultAnimYakuIdx < totalYaku) {
+                    resultAnimYakuIdx++;
+                    playResultStepSound(sl);
+                    resultAnimNextTick = now + RESULT_ANIM_YAKU_TICKS;
+                    changed = true;
+                } else {
+                    resultAnimStage = ResultAnimStage.SHOW_FINAL;
+                    resultAnimNextTick = now + RESULT_ANIM_YAKU_TICKS;
+                    changed = true;
+                }
+            }
+            case SHOW_FINAL -> {
+                // 大众麻将无赢牌庆祝（不发 MahjongRoundResolvedEvent）。
+                playResultStepSound(sl);
+                resultAnimStage = ResultAnimStage.AWAITING_ADVANCE;
+                resultAnimNextTick = Long.MAX_VALUE;
+                changed = true;
+            }
+            case AWAITING_ADVANCE, NONE -> {
+                // Idle — wait for centre-RMB.
+            }
+        }
+        if (changed) markChangedAndSynced();
+    }
+
+    /** Total yaku-line count across all Chinese winners (0 for a draw). */
+    private static int totalChineseYakuLineCount(ChineseMatchPhase.RoundEnded re) {
+        int n = 0;
+        for (ChineseWinResult wr : re.results()) n += wr.yaku().size();
+        return n;
     }
 
     // ---- Round-result animation ------------------------------------------
