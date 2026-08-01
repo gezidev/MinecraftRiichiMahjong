@@ -127,7 +127,7 @@ public class MahjongTableBlock extends BaseMultipartBlock {
         if (held.getItem() instanceof MahjongTableRecordItem record && player instanceof ServerPlayer sp) {
             if (table.state() != MahjongTableBlockEntity.State.IDLE) {
                 sp.displayClientMessage(
-                        Component.literal("End the current match before using a table record."), true);
+                        Component.literal("使用牌局记录前请先结束当前对局。"), true);
                 return InteractionResult.CONSUME;
             }
             boolean filled = record.isPredefinedFixtureForRouting()
@@ -151,7 +151,7 @@ public class MahjongTableBlock extends BaseMultipartBlock {
                         table.advanceRoundAfterResult();
                     } else {
                         sp.displayClientMessage(
-                                Component.literal("Click the table centre to start the next round."),
+                                Component.literal("点击牌桌中央开始下一轮。"),
                                 true);
                     }
                 }

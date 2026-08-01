@@ -48,7 +48,7 @@ public final class CuteEditorScreen extends Screen {
     private final List<Runnable> fieldRefreshers = new ArrayList<>();
 
     public CuteEditorScreen() {
-        super(Component.literal("Cute Layout Editor (F8)"));
+        super(Component.literal("可爱布局编辑器（F8）"));
     }
 
     @Override
@@ -113,19 +113,19 @@ public final class CuteEditorScreen extends Screen {
     private void rebuildBottomBar() {
         int y = (height - 30);
         int x = LIST_X;
-        addRenderableWidget(Button.builder(Component.literal("Reset selected"),
+        addRenderableWidget(Button.builder(Component.literal("重置选中"),
                         b -> { CuteEditor.pushUndo(); CuteEditor.resetSelected(); refresh(); })
                 .bounds(x, y, 100, 20).build());
         x += 105;
-        addRenderableWidget(Button.builder(Component.literal("Reset all"),
+        addRenderableWidget(Button.builder(Component.literal("全部重置"),
                         b -> { CuteEditor.pushUndo(); CuteEditor.resetAll(); refresh(); })
                 .bounds(x, y, 80, 20).build());
         x += 85;
-        addRenderableWidget(Button.builder(Component.literal("Copy Java"),
+        addRenderableWidget(Button.builder(Component.literal("复制 Java"),
                         b -> Minecraft.getInstance().keyboardHandler.setClipboard(CuteEditor.exportToJava()))
                 .bounds(x, y, 80, 20).build());
         x += 85;
-        addRenderableWidget(Button.builder(Component.literal("Close"),
+        addRenderableWidget(Button.builder(Component.literal("关闭"),
                         b -> CuteEditor.toggle())
                 .bounds(x, y, 60, 20).build());
     }

@@ -5,6 +5,13 @@ import com.riichimahjongforge.mahjongcore.MahjongWinEffects;
 import com.riichimahjongforge.RiichiMahjongForgeMod;
 import com.riichimahjongforge.cuterenderer.CuteClickHandler;
 import com.riichimahjongforge.cuterenderer.InteractKey;
+import com.riichimahjongforge.chinesemahjong.ChineseDriverNbt;
+import com.riichimahjongforge.chinesemahjong.ChineseGameDriver;
+import com.riichimahjongforge.chinesemahjong.ChineseMatchPhase;
+import com.riichimahjongforge.chinesemahjong.ChinesePlayerInterface;
+import com.riichimahjongforge.chinesemahjong.ChineseRoundState;
+import com.riichimahjongforge.chinesemahjong.ChineseStupidActiveBot;
+import com.riichimahjongforge.chinesemahjong.client.ChineseMahjongTableHumanPlayer;
 import com.riichimahjongforge.themahjongcompat.DriverNbt;
 import com.themahjong.TheMahjongMatch;
 import com.themahjong.driver.MahjongPlayerInterface;
@@ -116,6 +123,7 @@ public class MahjongTableBlockEntity extends BlockEntity implements Container, M
     private static final String NBT_STATE = "State";
     private static final String NBT_LAST_POWERED = "LastPowered";
     private static final String NBT_DRIVER = "Driver";
+    private static final String NBT_CHINESE_DRIVER = "ChineseDriver";
     private static final String NBT_SEATS = "Seats";
     private static final String NBT_SEAT_ENABLED = "enabled";
     private static final String NBT_SEAT_OCCUPANT = "uuid";
@@ -151,6 +159,10 @@ public class MahjongTableBlockEntity extends BlockEntity implements Container, M
 
     @Nullable
     private TheMahjongDriver driver;
+
+    /** Chinese-regional driver (四川/东北/广东). Mutually exclusive with {@link #driver}. */
+    @Nullable
+    private ChineseGameDriver chineseDriver;
 
     // ---- Round-end result animation ---------------------------------------
     /** Stages of the round-result reveal animation. {@code AWAITING_ADVANCE}
@@ -195,9 +207,12 @@ public class MahjongTableBlockEntity extends BlockEntity implements Container, M
     @Nullable
     public TheMahjongDriver driver() { return driver; }
 
+    @Nullable
+    public ChineseGameDriver chineseDriver() { return chineseDriver; }
+
     public List<SeatInfo> seats() { return List.copyOf(seats); }
 
-    public boolean hasActiveMatch() { return driver != null; }
+    public boolean hasActiveMatch() { return driver != null || chineseDriver != null; }
 
     public OptionalInt seatOfPlayer(UUID uuid) {
         for (int i = 0; i < seats.size(); i++) {
@@ -323,6 +338,9 @@ public class MahjongTableBlockEntity extends BlockEntity implements Container, M
     }
 
     private boolean driverIsTerminal() {
+        if (chineseDriver != null) {
+            return chineseDriver.currentPhase() instanceof ChineseMatchPhase.MatchEnded;
+        }
         return driver == null || driver.currentPhase() instanceof MatchPhase.MatchEnded;
     }
 
@@ -341,6 +359,20 @@ public class MahjongTableBlockEntity extends BlockEntity implements Container, M
         RuleSetPreset effective = effectivePreset();
         if (!seatsMatchCanonicalLayout(effective.playerCount())) {
             return StartMatchResult.SEATS_MISMATCH_PRESET;
+        }
+
+        if (effective.isChinese()) {
+            com.riichimahjongforge.chinesemahjong.ChineseMatch cm =
+                    effective.chinese().newMatch();
+            List<SeatInfo> activeSeats = new ArrayList<>(cm.playerCount());
+            for (int i = 0; i < cm.playerCount(); i++) activeSeats.add(seats.get(i));
+            this.randomSeed = seed;
+            this.chineseDriver = new ChineseGameDriver(
+                    cm, buildChinesePlayersFromSeats(activeSeats), new Random(seed));
+            this.chineseDriver.startMatch();
+            this.state = State.GAME;
+            markChangedAndSynced();
+            return StartMatchResult.STARTED;
         }
 
         TheMahjongMatch match = effective.newMatch().validate();
@@ -539,6 +571,10 @@ public class MahjongTableBlockEntity extends BlockEntity implements Container, M
      */
     @Override
     public void onCuteClick(ServerPlayer player, InteractKey key) {
+        if (chineseDriver != null) {
+            routeChineseClick(player, key);
+            return;
+        }
         if (driver == null) return;
         int seat = seatOfOccupant(player.getUUID());
         if (seat < 0) return;
@@ -560,6 +596,10 @@ public class MahjongTableBlockEntity extends BlockEntity implements Container, M
      * claim. See {@link MahjongTableHumanPlayer#onTableRightClick}.
      */
     public void onTableRightClick(ServerPlayer player) {
+        if (chineseDriver != null) {
+            routeChineseRightClick(player);
+            return;
+        }
         if (driver == null) return;
         // Suppress when a cute click was already processed this tick — both
         // events can fire from the same RMB (tile cute interactive doesn't
@@ -573,6 +613,30 @@ public class MahjongTableBlockEntity extends BlockEntity implements Container, M
         var roundOpt = driver.match().currentRound();
         if (roundOpt.isEmpty()) return;
         human.onTableRightClick(driver, driver.currentPhase(), seat, player);
+    }
+
+    private void routeChineseClick(ServerPlayer player, InteractKey key) {
+        int seat = seatOfOccupant(player.getUUID());
+        if (seat < 0) return;
+        if (!(chineseDriver.playerAt(seat) instanceof ChineseMahjongTableHumanPlayer human)) return;
+        ChineseRoundState round = chineseDriver.match().currentRound();
+        if (round == null) return;
+        if (level != null) lastCuteClickGameTime = level.getGameTime();
+        if (key instanceof com.riichimahjongforge.cuterenderer.InteractKey.SeatSlot ss
+                && ss.area() == com.riichimahjongforge.cuterenderer.InteractKey.SeatSlot.AREA_BUTTON) {
+            org.slf4j.LoggerFactory.getLogger("ChinClick").info("server got button click seat={} idx={} phase={}",
+                    ss.seat(), ss.index(), chineseDriver.currentPhase());
+        }
+        human.onCuteClick(key, chineseDriver, seat, player);
+        markChangedAndSynced();
+    }
+
+    private void routeChineseRightClick(ServerPlayer player) {
+        if (level != null && level.getGameTime() == lastCuteClickGameTime) return;
+        int seat = seatOfOccupant(player.getUUID());
+        if (seat < 0) return;
+        if (!(chineseDriver.playerAt(seat) instanceof ChineseMahjongTableHumanPlayer human)) return;
+        human.onTableRightClick(chineseDriver, chineseDriver.currentPhase(), seat, player);
     }
 
     /** Returns the seat index for {@code uuid}, or -1 if not seated. */
@@ -609,9 +673,28 @@ public class MahjongTableBlockEntity extends BlockEntity implements Container, M
         return StupidActiveBot.humanLike();
     }
 
+    private static List<ChinesePlayerInterface> buildChinesePlayersFromSeats(List<SeatInfo> seats) {
+        List<ChinesePlayerInterface> out = new ArrayList<>(seats.size());
+        for (SeatInfo info : seats) {
+            if (info.occupant().isPresent()) {
+                ChineseMahjongTableHumanPlayer p = new ChineseMahjongTableHumanPlayer();
+                p.setOccupant(info.occupant().get());
+                out.add(p);
+            } else {
+                // Heuristic bot for 大众麻将: smarter discards, cheaper than probing.
+                out.add(new com.riichimahjongforge.chinesemahjong.ChineseHeuristicBot());
+            }
+        }
+        return out;
+    }
+
     // ---- ticking ----------------------------------------------------------
 
     private void serverTick() {
+        if (chineseDriver != null) {
+            chineseServerTick();
+            return;
+        }
         if (driver == null) return;
         if (!(level instanceof ServerLevel sl)) return;
 
@@ -626,9 +709,13 @@ public class MahjongTableBlockEntity extends BlockEntity implements Container, M
         // the action that triggered them — no inter-tick fragility.
         MatchPhase prevPhase = driver.currentPhase();
         TheMahjongMatch prevMatch = driver.match();
+        // Sanma (3-player) drivers only have playerCount players; the table always
+        // has 4 seats, so bound every player loop by playerCount — indexing
+        // playerAt() past the driver's player list throws and crashes the server.
+        int playerCount = prevMatch.playerCount();
 
         // 1. Validate queues against current inv.
-        for (int i = 0; i < seats.size(); i++) {
+        for (int i = 0; i < playerCount; i++) {
             if (driver.playerAt(i) instanceof MahjongTableHumanPlayer human) {
                 human.validateBeforeAdvance(sl);
             }
@@ -643,7 +730,7 @@ public class MahjongTableBlockEntity extends BlockEntity implements Container, M
 
         // 3. Post-advance: consume / deliver / auto-discard. Always runs.
         boolean playerStateChanged = false;
-        for (int i = 0; i < seats.size(); i++) {
+        for (int i = 0; i < playerCount; i++) {
             if (driver.playerAt(i) instanceof MahjongTableHumanPlayer human) {
                 if (human.tickAfterAdvance(sl, this, i, nextPhase)) playerStateChanged = true;
             }
@@ -667,6 +754,52 @@ public class MahjongTableBlockEntity extends BlockEntity implements Container, M
             // snapshot was last written (typically right after match start),
             // re-running the deal animation and re-delivering already-given
             // tiles. markChangedAndSynced does both: setChanged + sync packet.
+            markChangedAndSynced();
+        }
+    }
+
+    /** Chinese-regional tick: validate queues, advance the Chinese driver, then
+     *  deliver/consume drawn tiles for human players (mirrors the riichi
+     *  {@link #serverTick} flow). Flips straight to AWAITING_ADVANCE on RoundEnded
+     *  (no staged reveal — the renderer reads the Chinese result payload directly). */
+    private void chineseServerTick() {
+        if (!(level instanceof ServerLevel sl)) return;
+        if (chineseDriver == null) return;
+        ChineseMatchPhase prevPhase = chineseDriver.currentPhase();
+        int playerCount = chineseDriver.match().playerCount();
+
+        // 1. Validate queues against current inv (anti-dupe).
+        for (int i = 0; i < playerCount; i++) {
+            if (chineseDriver.playerAt(i) instanceof ChineseMahjongTableHumanPlayer human) {
+                human.validateBeforeAdvance(sl);
+            }
+        }
+
+        // 2. Driver advance (paused during result animation).
+        boolean animating = resultAnimStage != ResultAnimStage.NONE;
+        if (!animating) {
+            chineseDriver.advance(SECONDS_PER_TICK);
+        }
+        ChineseMatchPhase nextPhase = chineseDriver.currentPhase();
+
+        // 3. Post-advance: consume on phase exit / deliver new draws.
+        boolean playerStateChanged = false;
+        for (int i = 0; i < playerCount; i++) {
+            if (chineseDriver.playerAt(i) instanceof ChineseMahjongTableHumanPlayer human) {
+                if (human.tickAfterAdvance(sl, this, i, nextPhase)) playerStateChanged = true;
+            }
+        }
+
+        if (animating) {
+            if (playerStateChanged) markChangedAndSynced();
+            return;
+        }
+        if (!(prevPhase instanceof ChineseMatchPhase.RoundEnded)
+                && nextPhase instanceof ChineseMatchPhase.RoundEnded) {
+            resultAnimStage = ResultAnimStage.AWAITING_ADVANCE;
+            markChangedAndSynced();
+        }
+        if (prevPhase != nextPhase || playerStateChanged) {
             markChangedAndSynced();
         }
     }
@@ -808,6 +941,13 @@ public class MahjongTableBlockEntity extends BlockEntity implements Container, M
      * result-hold state.
      */
     public void advanceRoundAfterResult() {
+        if (chineseDriver != null) {
+            if (resultAnimStage != ResultAnimStage.AWAITING_ADVANCE) return;
+            clearResultAnimState();
+            chineseDriver.advanceRound();
+            markChangedAndSynced();
+            return;
+        }
         if (driver == null) return;
         if (resultAnimStage != ResultAnimStage.AWAITING_ADVANCE) return;
         if (!(driver.currentPhase() instanceof MatchPhase.RoundEnded re)) {
@@ -893,8 +1033,16 @@ public class MahjongTableBlockEntity extends BlockEntity implements Container, M
      *  so the client renderer can hide the drawn tile from the rendered
      *  hand consistently — even if the player later moved the item. */
     public boolean drawnTileDeliveredForSeat(int seat) {
-        if (driver == null || seat < 0 || seat >= driver.match().playerCount()) return false;
-        return driver.playerAt(seat) instanceof MahjongTableHumanPlayer h && h.drawnTileDelivered();
+        if (seat < 0) return false;
+        if (driver != null && seat < driver.match().playerCount()
+                && driver.playerAt(seat) instanceof MahjongTableHumanPlayer h) {
+            return h.drawnTileDelivered();
+        }
+        if (chineseDriver != null && seat < chineseDriver.match().playerCount()
+                && chineseDriver.playerAt(seat) instanceof ChineseMahjongTableHumanPlayer ch) {
+            return ch.drawnTileDelivered();
+        }
+        return false;
     }
 
     /** Read by the renderer to display the RIICHI button as toggled-on. */
@@ -1066,23 +1214,42 @@ public class MahjongTableBlockEntity extends BlockEntity implements Container, M
         }
         tag.put(NBT_INVENTORY, list);
 
+        if (chineseDriver != null) {
+            tag.put(NBT_CHINESE_DRIVER, ChineseDriverNbt.writeDriver(chineseDriver));
+            tag.putLong(NBT_RANDOM_SEED, randomSeed);
+            writeHumanPlayers(tag);
+        }
+
         if (driver != null) {
             tag.put(NBT_DRIVER, DriverNbt.writeDriver(driver));
             tag.putLong(NBT_RANDOM_SEED, randomSeed);
-            // Per-seat human player state (delivery latches, pending consume).
-            // Must be persisted so save/load (chunk unload, break+place) doesn't
-            // re-attempt delivery and dupe items. Indexed by seat.
-            ListTag humans = new ListTag();
-            for (int i = 0; i < seats.size(); i++) {
-                CompoundTag entry = new CompoundTag();
-                entry.putInt("Seat", i);
-                if (driver.playerAt(i) instanceof MahjongTableHumanPlayer h) {
-                    h.writeNbt(entry);
-                }
-                humans.add(entry);
-            }
-            tag.put(NBT_HUMAN_PLAYERS, humans);
+            writeHumanPlayers(tag);
         }
+    }
+
+    /**
+     * Persists per-seat human-player delivery state (delivery latches, pending
+     * consume) for whichever driver is live. Must be persisted so save/load
+     * (chunk unload, break+place) doesn't re-attempt delivery and dupe items.
+     * Indexed by seat, bounded by the active driver's player count (sanma-safe).
+     */
+    private void writeHumanPlayers(CompoundTag tag) {
+        if (driver == null && chineseDriver == null) return;
+        ListTag humans = new ListTag();
+        int n = driver != null ? driver.match().playerCount()
+                : chineseDriver.match().playerCount();
+        for (int i = 0; i < n; i++) {
+            CompoundTag entry = new CompoundTag();
+            entry.putInt("Seat", i);
+            if (driver != null && driver.playerAt(i) instanceof MahjongTableHumanPlayer h) {
+                h.writeNbt(entry);
+            } else if (chineseDriver != null
+                    && chineseDriver.playerAt(i) instanceof ChineseMahjongTableHumanPlayer ch) {
+                ch.writeNbt(entry);
+            }
+            humans.add(entry);
+        }
+        tag.put(NBT_HUMAN_PLAYERS, humans);
     }
 
     @Override
@@ -1114,6 +1281,34 @@ public class MahjongTableBlockEntity extends BlockEntity implements Container, M
                 preset = RuleSetPreset.valueOf(tag.getString(NBT_PRESET));
             } catch (IllegalArgumentException ignored) {
                 preset = RuleSetPreset.MAHJONG_SOUL_4P;
+            }
+        }
+        if (state == State.GAME && tag.contains(NBT_CHINESE_DRIVER, Tag.TAG_COMPOUND)) {
+            this.randomSeed = tag.getLong(NBT_RANDOM_SEED);
+            padSeatsAtLeast(DEFAULT_SEAT_COUNT);
+            int playerCount = tag.getCompound(NBT_CHINESE_DRIVER).getInt("playerCount");
+            List<SeatInfo> activeSeats = new ArrayList<>(playerCount);
+            for (SeatInfo info : seats) {
+                if (info.enabled()) activeSeats.add(info);
+                if (activeSeats.size() == playerCount) break;
+            }
+            while (activeSeats.size() < playerCount) activeSeats.add(SeatInfo.open()); // defensive
+            this.chineseDriver = ChineseDriverNbt.readDriver(
+                    tag.getCompound(NBT_CHINESE_DRIVER),
+                    buildChinesePlayersFromSeats(activeSeats),
+                    new Random(this.randomSeed));
+            // Restore per-seat Chinese human delivery state so a reload mid-turn
+            // doesn't re-deliver the drawn tile and dupe items.
+            if (tag.contains(NBT_HUMAN_PLAYERS, Tag.TAG_LIST)) {
+                ListTag humans = tag.getList(NBT_HUMAN_PLAYERS, Tag.TAG_COMPOUND);
+                for (int i = 0; i < humans.size(); i++) {
+                    CompoundTag entry = humans.getCompound(i);
+                    int seat = entry.getInt("Seat");
+                    if (seat >= 0 && seat < chineseDriver.match().playerCount()
+                            && chineseDriver.playerAt(seat) instanceof ChineseMahjongTableHumanPlayer ch) {
+                        ch.readNbt(entry);
+                    }
+                }
             }
         }
 

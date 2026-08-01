@@ -1,5 +1,6 @@
 package com.riichimahjongforge.mahjongtable;
 
+import com.riichimahjongforge.chinesemahjong.ChineseRulePreset;
 import com.themahjong.TheMahjongMatch;
 
 import java.util.function.Supplier;
@@ -8,9 +9,9 @@ import java.util.function.Supplier;
  * A named ruleset / player-count combination the table can be configured to play.
  * Each preset bundles:
  * <ul>
- *   <li>The library factory that produces the {@link TheMahjongMatch}.</li>
- *   <li>The player count, which dictates the canonical seat layout
- *       (seats {@code 0..playerCount-1} open, rest closed).</li>
+ *   <li>The library factory that produces the {@link TheMahjongMatch} (riichi), or</li>
+ *   <li>A {@link ChineseRulePreset} for Chinese play (大众麻将).</li>
+ *   <li>The player count, which dictates the canonical seat layout.</li>
  *   <li>A translation key for UI display.</li>
  * </ul>
  *
@@ -18,54 +19,38 @@ import java.util.function.Supplier;
  * fallback from MS-4P to {@link #MAHJONG_SOUL_SANMA_3P} when the player closes the
  * North seat (handled in the BE), so a freshly placed table can be played as either
  * 4-player or sanma without opening settings.
- *
- * <p><b>TODO — library refactor opportunity.</b> This enum currently lives mod-side
- * and pulls together three things that ought to be one in the library:
- * <ul>
- *   <li>The 5 hardcoded factories on {@link TheMahjongMatch} ({@code defaults},
- *       {@code defaultTenhou}, {@code defaultMahjongSoul}, {@code defaultTenhouSanma},
- *       {@code defaultMahjongSoulSanma}). Each spells out starting points, target
- *       points, tile set, and rule flags inline.</li>
- *   <li>The {@code (key, playerCount)} bundle here, duplicating the player count
- *       that's already inside the produced {@link TheMahjongMatch}.</li>
- *   <li>The implicit "this is a canonical, named configuration" concept that has no
- *       first-class home today.</li>
- * </ul>
- *
- * TODO:
- *   <p>The cleaner shape is to move starting points, target points, tile set, and
- *   player count <i>into</i> {@link com.themahjong.TheMahjongRuleSet} so a ruleset is
- *   the complete match configuration, then expose a {@code TheMahjongRuleSet.Preset}
- *   (or {@code TheMahjongMatch.Preset}) enum in the library that lists the named
- *   canonical rulesets. The 5 standalone factories collapse to a single
- *   {@code TheMahjongMatch.startFromPreset(Preset, Random)}. This mod-side enum then
- *   deletes; the BE stores {@code TheMahjongMatch.Preset} directly. Lang keys derive
- *   from {@code preset.name().toLowerCase()} so no string field is needed.
- *
- * <p>Defer because: the library refactor touches every test that constructs a match
- * via the existing factories (~40+ files) and forces a decision on backward-compat
- * for the 5 existing public factory methods. Worth doing in a dedicated pass.
  */
 public enum RuleSetPreset {
-    MAHJONG_SOUL_4P("mahjong_soul_4p", 4, TheMahjongMatch::defaultMahjongSoul),
-    TENHOU_4P("tenhou_4p", 4, TheMahjongMatch::defaultTenhou),
-    WRC_4P("wrc_4p", 4, TheMahjongMatch::defaults),
-    MAHJONG_SOUL_SANMA_3P("mahjong_soul_sanma_3p", 3, TheMahjongMatch::defaultMahjongSoulSanma),
-    TENHOU_SANMA_3P("tenhou_sanma_3p", 3, TheMahjongMatch::defaultTenhouSanma);
+    MAHJONG_SOUL_4P("mahjong_soul_4p", 4, TheMahjongMatch::defaultMahjongSoul, null),
+    TENHOU_4P("tenhou_4p", 4, TheMahjongMatch::defaultTenhou, null),
+    WRC_4P("wrc_4p", 4, TheMahjongMatch::defaults, null),
+    MAHJONG_SOUL_SANMA_3P("mahjong_soul_sanma_3p", 3, TheMahjongMatch::defaultMahjongSoulSanma, null),
+    TENHOU_SANMA_3P("tenhou_sanma_3p", 3, TheMahjongMatch::defaultTenhouSanma, null),
+    MASS_MAHJONG_4P("mass_mahjong_4p", 4, null, ChineseRulePreset.MASS_MAHJONG);
 
     private final String key;
     private final int playerCount;
     private final Supplier<TheMahjongMatch> factory;
+    private final ChineseRulePreset chinese;
 
-    RuleSetPreset(String key, int playerCount, Supplier<TheMahjongMatch> factory) {
+    RuleSetPreset(String key, int playerCount, Supplier<TheMahjongMatch> factory, ChineseRulePreset chinese) {
         this.key = key;
         this.playerCount = playerCount;
         this.factory = factory;
+        this.chinese = chinese;
     }
 
     public int playerCount() { return playerCount; }
 
-    public TheMahjongMatch newMatch() { return factory.get(); }
+    public boolean isChinese() { return chinese != null; }
+
+    public ChineseRulePreset chinese() { return chinese; }
+
+    /** Riichi presets only — Chinese presets throw (the BE branches on {@link #isChinese()}). */
+    public TheMahjongMatch newMatch() {
+        if (factory == null) throw new UnsupportedOperationException("Chinese presets use ChineseMatch");
+        return factory.get();
+    }
 
     public String langKey() { return "riichi_mahjong_forge.preset." + key; }
 }

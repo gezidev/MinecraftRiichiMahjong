@@ -132,14 +132,14 @@ public abstract class MahjongTableRecordSimpleEastHandItem extends MahjongTableR
             match = buildMatch();
         } catch (RuntimeException ex) {
             player.displayClientMessage(
-                    Component.literal("Predefined record failed to build: " + ex.getMessage()), true);
+                    Component.literal("预置记录构建失败：" + ex.getMessage()), true);
             return false;
         }
         StartMatchResult result = table.tryApplyPredefined(
                 /* seed */ 0xC6E4D31L, preset(), match, player.getUUID());
         if (result == StartMatchResult.NOT_IDLE) {
             player.displayClientMessage(
-                    Component.literal("Cannot load record: end the current match first."), true);
+                    Component.literal("无法载入记录：请先结束当前对局。"), true);
             return false;
         }
         return true;
@@ -150,7 +150,7 @@ public abstract class MahjongTableRecordSimpleEastHandItem extends MahjongTableR
         // Predefined records are write-once at registration. Don't let RMB clobber the
         // baked situation with a snapshot of whatever's currently on the table.
         player.displayClientMessage(
-                Component.literal("Predefined records cannot be re-recorded."), true);
+                Component.literal("预置记录无法重新录制。"), true);
         return false;
     }
 

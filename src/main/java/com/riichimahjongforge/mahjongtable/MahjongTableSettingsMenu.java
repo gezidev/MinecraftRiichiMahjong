@@ -28,7 +28,7 @@ public class MahjongTableSettingsMenu extends AbstractContainerMenu {
     public static final int GRID_LEFT = 8;
     public static final int CONTENT_TOP = 24;
     /** Height reserved for the preset buttons row before player inventory starts. */
-    public static final int CONTENT_HEIGHT = 130;
+    public static final int CONTENT_HEIGHT = 210;
     public static final int PLAYER_INV_TOP_GAP = 14;
     public static final int HOTBAR_Y_OFFSET = 58;
     public static final int HOTBAR_HEIGHT = 18;

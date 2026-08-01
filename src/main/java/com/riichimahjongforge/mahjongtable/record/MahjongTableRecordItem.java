@@ -78,7 +78,7 @@ public class MahjongTableRecordItem extends Item {
         StartMatchResult result = table.tryApplyRecordSnapshot(snapshot, player.getUUID());
         if (result == StartMatchResult.NOT_IDLE) {
             player.displayClientMessage(
-                    Component.literal("Cannot load record: end the current match first."), true);
+                    Component.literal("无法载入记录：请先结束当前对局。"), true);
             return false;
         }
         return true;
@@ -92,7 +92,7 @@ public class MahjongTableRecordItem extends Item {
     public boolean recordFromTable(ServerPlayer player, MahjongTableBlockEntity table, ItemStack stack) {
         if (hasRecordedTableState(stack)) {
             player.displayClientMessage(
-                    Component.literal("Record is already filled — drop the snapshot first."), true);
+                    Component.literal("记录已填满——请先放下快照。"), true);
             return false;
         }
         writeRecordedTableState(stack, table.exportRecordSnapshot());

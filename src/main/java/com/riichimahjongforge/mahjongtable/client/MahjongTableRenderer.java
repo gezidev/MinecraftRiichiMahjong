@@ -6,11 +6,20 @@ import com.riichimahjongforge.mahjongcore.MahjongTileItems;
 import com.riichimahjongforge.RiichiMahjongForgeMod;
 import com.riichimahjongforge.common.BaseMultipartBlock;
 import com.riichimahjongforge.common.client.WorldSpaceTextRenderer;
+import com.riichimahjongforge.chinesemahjong.ChineseGameDriver;
+import com.riichimahjongforge.chinesemahjong.ChineseMatchPhase;
+import com.riichimahjongforge.chinesemahjong.ChinesePlayerAction;
+import com.riichimahjongforge.chinesemahjong.ChinesePlayerState;
+import com.riichimahjongforge.chinesemahjong.ChineseRoundState;
+import com.riichimahjongforge.chinesemahjong.ChineseWinResult;
+import com.riichimahjongforge.chinesemahjong.ChineseYaku;
+import com.riichimahjongforge.chinesemahjong.client.ChineseMahjongTableHumanPlayer;
 import com.riichimahjongforge.cuterenderer.BlockModelNode;
 import com.riichimahjongforge.cuterenderer.CuteNode;
 import com.riichimahjongforge.cuterenderer.CuteRenderer;
 import com.riichimahjongforge.cuterenderer.GroupNode;
 import com.riichimahjongforge.cuterenderer.HoverHighlightRenderer;
+import com.riichimahjongforge.cuterenderer.InteractKey;
 import com.riichimahjongforge.cuterenderer.WorldButtonNode;
 import com.riichimahjongforge.cuterenderer.editor.CuteEditor;
 import com.riichimahjongforge.cuterenderer.editor.LayoutEntry;
@@ -20,6 +29,7 @@ import com.riichimahjongforge.mahjongcore.MahjongWinEffects;
 import com.riichimahjongforge.mahjongtable.MahjongTableBlockEntity.ResultAnimStage;
 import com.riichimahjongforge.mahjongtable.MahjongTableHumanPlayer;
 import com.themahjong.TheMahjongMatch;
+import com.themahjong.TheMahjongMeld;
 import com.themahjong.TheMahjongPlayer;
 import com.themahjong.TheMahjongRound;
 import com.themahjong.TheMahjongTile;
@@ -394,6 +404,27 @@ public class MahjongTableRenderer implements BlockEntityRenderer<MahjongTableBlo
      *  the same tick when {@code render()} runs more than once per tick. */
     private long lastParticleTick = Long.MIN_VALUE;
 
+    // Chinese-mahjong scene staleness cache. ChineseRoundState is mutable and
+    // reused for an entire deal — unlike the immutable riichi round, the round
+    // reference alone can't gate the rebuild (the scene would freeze mid-deal).
+    // We therefore key on the observable mutable state the scene renders.
+    @Nullable private ChineseRoundState lastChineseRound;
+    @Nullable private Direction lastChineseFacing;
+    private int lastChineseLocalSeat = -1;
+    private boolean lastChineseLocalInteractive;
+    private boolean lastChineseDrawnDelivered;
+    private boolean lastChineseInResult;
+    private ChineseRoundState.State lastChineseState;
+    private int lastChineseTurnSeat;
+    private int lastChineseClaimFromSeat;
+    private ChineseRoundState.ClaimKind lastChineseClaimKind;
+    @Nullable private TheMahjongTile lastChineseActiveTile;
+    private int lastChineseWallSize;
+    private int lastChineseWinResultsSize;
+    private final int[] lastChineseHandSize = new int[4];
+    private final int[] lastChineseDiscardSize = new int[4];
+    private final int[] lastChineseMeldSize = new int[4];
+
     public MahjongTableRenderer(BlockEntityRendererProvider.Context ctx) {
         this.font = ctx.getFont();
     }
@@ -410,7 +441,7 @@ public class MahjongTableRenderer implements BlockEntityRenderer<MahjongTableBlo
         if (level == null) return;
         Direction facing = table.getBlockState().getValue(BaseMultipartBlock.FACING);
         List<MahjongTableBlockEntity.SeatInfo> seats = table.seats();
-        int turnSeat = currentTurnSeat(table);
+        int turnSeat = table.chineseDriver() != null ? chineseTurnSeat(table) : currentTurnSeat(table);
 
         // 1. Wind/score/name edge labels.
         for (Direction cellDir : HORIZONTAL) {
@@ -419,13 +450,19 @@ public class MahjongTableRenderer implements BlockEntityRenderer<MahjongTableBlo
             MahjongTableBlockEntity.SeatInfo info = seats.get(seat);
             List<Component> lines = info.enabled()
                     ? List.of(buildWindLine(seat, table), buildNameLine(info, level))
-                    : List.of(Component.literal("CLOSED"));
+                    : List.of(Component.literal("已关闭"));
             WorldSpaceTextRenderer.drawOutwardLines(
                     poseStack, buffers, packedLight, font,
                     0.5 + cellDir.getStepX() * EDGE_PUSH, TEXT_Y, 0.5 + cellDir.getStepZ() * EDGE_PUSH,
                     cellDir,
                     seat == turnSeat ? STYLE_TURN : STYLE_NORMAL,
                     lines);
+        }
+
+        // 1b. Chinese-regional play — a compact scene built from ChineseRoundState.
+        if (table.chineseDriver() != null) {
+            renderChinese(table, facing, poseStack, buffers, packedLight, packedOverlay, partialTick);
+            return;
         }
 
         // 2. CuteRenderer-driven tile scene.
@@ -489,6 +526,325 @@ public class MahjongTableRenderer implements BlockEntityRenderer<MahjongTableBlo
                 }
             }
         }
+    }
+
+    /** Current-turn seat for Chinese play, used for the edge-label highlight. */
+    private static int chineseTurnSeat(MahjongTableBlockEntity table) {
+        ChineseGameDriver d = table.chineseDriver();
+        if (d == null) return -1;
+        ChineseRoundState r = d.match().currentRound();
+        if (r == null) return -1;
+        return switch (r.state()) {
+            case AWAITING_DISCARD, AWAITING_DRAW -> r.currentTurnSeat();
+            case CLAIM_WINDOW -> r.claimFromSeat();
+            default -> -1;
+        };
+    }
+
+    /**
+     * Chinese-regional renderer (大众麻将): hand / river / melds / buttons from
+     * {@link ChineseRoundState}, plus a billboarded result banner. The scene is
+     * rebuilt only when observable mutable state changes — mirroring the riichi
+     * staleness cache so hover-lift / glide animations aren't reset every frame.
+     * Orange outlines mark legal-to-discard hand tiles and the active tile.
+     */
+    private void renderChinese(MahjongTableBlockEntity table, Direction facing, PoseStack poseStack,
+                               MultiBufferSource buffers, int packedLight, int packedOverlay, float partialTick) {
+        ChineseGameDriver driver = table.chineseDriver();
+        if (driver == null) return;
+        ChineseRoundState round = driver.match().currentRound();
+        if (round == null) return;
+
+        ensureBound(table);
+        rebuildChineseSceneIfStale(table, round, facing, driver);
+        cute.frame(poseStack, buffers, packedLight, packedOverlay, partialTick);
+
+        // Orange highlights — legal-discard tiles first, then the active tile
+        // (same two-pass order and colour as the riichi scene).
+        for (CuteNode node : legalDiscardNodes) {
+            HoverHighlightRenderer.drawNodeOutline(poseStack, buffers, node,
+                    HIGHLIGHT_R, HIGHLIGHT_G, HIGHLIGHT_B, HIGHLIGHT_A);
+        }
+        for (CuteNode node : activeTileNodes) {
+            HoverHighlightRenderer.drawNodeOutline(poseStack, buffers, node,
+                    HIGHLIGHT_R, HIGHLIGHT_G, HIGHLIGHT_B, HIGHLIGHT_A);
+        }
+
+        if (table.isInResultPhase() && driver.currentPhase() instanceof ChineseMatchPhase.RoundEnded re) {
+            drawChineseResult(table, re, poseStack, buffers, packedLight);
+        }
+    }
+
+    /** Rebuilds the Chinese scene iff any observable state changed. Returns
+     *  whether a rebuild happened. Every scene-relevant mutation moves at least
+     *  one of the keyed fields, so the cached scene never goes stale mid-deal. */
+    private boolean rebuildChineseSceneIfStale(MahjongTableBlockEntity table, ChineseRoundState round,
+                                               Direction facing, ChineseGameDriver driver) {
+        int localSeat = localSeat(table);
+        boolean localInteractive = localSeat >= 0 && localSeat < round.playerCount()
+                && (round.state() == ChineseRoundState.State.AWAITING_DISCARD
+                    || round.state() == ChineseRoundState.State.AWAITING_QUE_YI_MEN)
+                && round.currentTurnSeat() == localSeat;
+        boolean drawnDelivered = localSeat >= 0 && table.drawnTileDeliveredForSeat(localSeat);
+        boolean inResult = table.isInResultPhase();
+        boolean changed = round != lastChineseRound
+                || facing != lastChineseFacing
+                || localSeat != lastChineseLocalSeat
+                || localInteractive != lastChineseLocalInteractive
+                || drawnDelivered != lastChineseDrawnDelivered
+                || inResult != lastChineseInResult
+                || round.state() != lastChineseState
+                || round.currentTurnSeat() != lastChineseTurnSeat
+                || round.claimFromSeat() != lastChineseClaimFromSeat
+                || round.claimKind() != lastChineseClaimKind
+                || !java.util.Objects.equals(round.activeTile(), lastChineseActiveTile)
+                || round.wallSize() != lastChineseWallSize
+                || round.winResults().size() != lastChineseWinResultsSize;
+        if (!changed) {
+            for (int seat = 0; seat < round.playerCount(); seat++) {
+                ChinesePlayerState p = round.players().get(seat);
+                if (p.currentHand().size() != lastChineseHandSize[seat]
+                        || p.discards().size() != lastChineseDiscardSize[seat]
+                        || p.melds().size() != lastChineseMeldSize[seat]) {
+                    changed = true;
+                    break;
+                }
+            }
+        }
+        if (!changed) return false;
+
+        lastChineseRound = round;
+        lastChineseFacing = facing;
+        lastChineseLocalSeat = localSeat;
+        lastChineseLocalInteractive = localInteractive;
+        lastChineseDrawnDelivered = drawnDelivered;
+        lastChineseInResult = inResult;
+        lastChineseState = round.state();
+        lastChineseTurnSeat = round.currentTurnSeat();
+        lastChineseClaimFromSeat = round.claimFromSeat();
+        lastChineseClaimKind = round.claimKind();
+        lastChineseActiveTile = round.activeTile();
+        lastChineseWallSize = round.wallSize();
+        lastChineseWinResultsSize = round.winResults().size();
+        for (int seat = 0; seat < round.playerCount(); seat++) {
+            ChinesePlayerState p = round.players().get(seat);
+            lastChineseHandSize[seat] = p.currentHand().size();
+            lastChineseDiscardSize[seat] = p.discards().size();
+            lastChineseMeldSize[seat] = p.melds().size();
+        }
+
+        for (int seat = 0; seat < seatRoots.length; seat++) {
+            if (seatRoots[seat] != null) {
+                cute.root().removeChild(seatRoots[seat]);
+                seatRoots[seat] = null;
+            }
+        }
+        activeTileNodes.clear();
+        legalDiscardNodes.clear();
+        buildChineseScene(table, round, facing, driver, localSeat);
+        return true;
+    }
+
+    /** Builds every seat's hand / river / melds / buttons / wall from
+     *  {@link ChineseRoundState}. Strips the delivered drawn tile from the local
+     *  hand and collects orange-highlight nodes (legal discards + active tile). */
+    private void buildChineseScene(MahjongTableBlockEntity table, ChineseRoundState round, Direction facing,
+                                   ChineseGameDriver driver, int localSeat) {
+        ActiveHighlight highlight = chineseActiveHighlight(round);
+        for (int seat = 0; seat < round.playerCount(); seat++) {
+            Direction outward = outwardForSeat(seat, facing);
+            if (outward == null) continue;
+            ChinesePlayerState p = round.players().get(seat);
+            GroupNode root = new GroupNode();
+
+            // Hand (standing, face-up). The drawn tile is pinned rightmost by
+            // handDisplayOrder; once delivered to the local player it is stripped
+            // so the rendered hand matches what the player physically holds.
+            List<TheMahjongTile> hand = round.handDisplayOrder(seat);
+            boolean localActive = seat == localSeat
+                    && (round.state() == ChineseRoundState.State.AWAITING_DISCARD
+                        || round.state() == ChineseRoundState.State.AWAITING_QUE_YI_MEN)
+                    && round.currentTurnSeat() == seat;
+            boolean drawnStripped = false;
+            if (seat == localSeat
+                    && round.state() == ChineseRoundState.State.AWAITING_DISCARD
+                    && round.currentTurnSeat() == seat
+                    && round.lastDrawSeat() == seat
+                    && round.activeTile() != null
+                    && table.drawnTileDeliveredForSeat(seat)) {
+                hand = hand.subList(0, hand.size() - 1);
+                drawnStripped = true;
+            }
+            // Legal-to-discard tiles for the local player's discard turn.
+            java.util.Set<TheMahjongTile> legalDiscards = java.util.Collections.emptySet();
+            if (localActive && round.state() == ChineseRoundState.State.AWAITING_DISCARD) {
+                legalDiscards = collectChineseLegalDiscards(driver.legalActions(seat));
+            }
+            if (!hand.isEmpty()) {
+                GroupNode handGroup = buildLineGroup(HAND, hand, outward, false);
+                List<CuteNode> children = handGroup.children();
+                BlockModelNode lastHandNode = null;
+                int idx = 0;
+                for (CuteNode child : children) {
+                    if (!(child instanceof BlockModelNode bm)) continue;
+                    if (localActive) {
+                        bm.makeClickable(new InteractKey.SeatSlot(
+                                (byte) seat, InteractKey.SeatSlot.AREA_HAND, (short) idx));
+                    }
+                    if (idx < hand.size()) {
+                        TheMahjongTile tile = hand.get(idx);
+                        if (legalDiscards.contains(tile)) legalDiscardNodes.add(bm);
+                    }
+                    lastHandNode = bm;
+                    idx++;
+                }
+                if (highlight.handSeat() == seat && !drawnStripped && lastHandNode != null) {
+                    activeTileNodes.add(lastHandNode);
+                }
+                root.addChild(handGroup);
+            }
+            // River — grid (cols × rows), same as riichi. The claimed tile during
+            // a discard claim window is the river's last tile.
+            if (!p.discards().isEmpty()) {
+                GroupNode river = buildGridGroup(RIVER, RIVER.i("cols"), RIVER.i("rows"),
+                        p.discards(), outward);
+                if (highlight.riverSeat() == seat) {
+                    List<CuteNode> rchildren = river.children();
+                    for (int ci = rchildren.size() - 1; ci >= 0; ci--) {
+                        if (rchildren.get(ci) instanceof BlockModelNode rbm) {
+                            activeTileNodes.add(rbm);
+                            break;
+                        }
+                    }
+                }
+                root.addChild(river);
+            }
+            // Melds — reuse the riichi meld-stack builder (same meld type).
+            if (!p.melds().isEmpty()) {
+                root.addChild(buildMeldsLive(MELDS, p.melds(), outward));
+            }
+            // Buttons for the local seat.
+            if (seat == localSeat) {
+                buildChineseButtons(root, ChineseMahjongTableHumanPlayer.chineseTableButtons(driver, seat),
+                        seat, outward);
+            }
+            // Wall — face-down stacks (WALL anchor auto-detects face-down).
+            // Each seat shows a slice of the remaining live wall.
+            int wallSize = round.wallSize();
+            int perSeat = (int) Math.ceil(wallSize / (double) round.playerCount());
+            int start = seat * perSeat;
+            int end = Math.min(wallSize, start + perSeat);
+            if (start < end) {
+                // layFlat=true → face-down stacks, same as the riichi wall.
+                root.addChild(buildLineGroup(WALL, round.wall().subList(start, end), outward, true));
+            }
+            seatRoots[seat] = root;
+            cute.root().addChild(root);
+        }
+    }
+
+    /** Drawn tile → on-turn seat's rightmost hand tile; claimed discard → the
+     *  discarder's last river tile during the claim window; else none. */
+    private static ActiveHighlight chineseActiveHighlight(ChineseRoundState round) {
+        return switch (round.state()) {
+            case AWAITING_DISCARD -> round.activeTile() != null
+                    && round.lastDrawSeat() == round.currentTurnSeat()
+                    ? ActiveHighlight.hand(round.currentTurnSeat()) : ActiveHighlight.NONE;
+            case CLAIM_WINDOW -> round.claimKind() == ChineseRoundState.ClaimKind.DISCARD
+                    ? ActiveHighlight.river(round.claimFromSeat()) : ActiveHighlight.NONE;
+            default -> ActiveHighlight.NONE;
+        };
+    }
+
+    private static java.util.Set<TheMahjongTile> collectChineseLegalDiscards(List<ChinesePlayerAction> legal) {
+        java.util.Set<TheMahjongTile> out = new java.util.HashSet<>();
+        for (ChinesePlayerAction a : legal) {
+            if (a instanceof ChinesePlayerAction.Discard d) out.add(d.tile());
+        }
+        return out;
+    }
+
+    /** Buttons for Chinese actions, laid out along the BUTTONS anchor, clickable. */
+    private void buildChineseButtons(GroupNode root, List<ChinesePlayerAction> actions, int seat, Direction outward) {
+        if (actions.isEmpty()) return;
+        Direction lineDir = outward.getCounterClockWise();
+        double[] c = anchorWorldOrigin(BUTTONS, outward);
+        float spacing = Math.max(0.14f, BUTTONS.f("colSpacing"));
+        // Larger, padded plates so Chinese labels are readable and clickable.
+        float textScale = 0.012f;
+        Quaternionf rot = baseTileRotation(BUTTONS, outward, true);
+        double start = -(actions.size() - 1) * spacing / 2.0;
+        for (int i = 0; i < actions.size(); i++) {
+            double off = start + i * spacing;
+            double x = c[0] + lineDir.getStepX() * off;
+            double z = c[2] + lineDir.getStepZ() * off;
+            WorldButtonNode btn = new WorldButtonNode(chineseActionLabel(actions.get(i)))
+                    .setTextScale(textScale)
+                    .setPlatePadding(9f, 5f)
+                    .setHoverScale(1.15f)
+                    .setHoverBrighten(28)
+                    .makeClickable(new InteractKey.SeatSlot(
+                            (byte) seat, InteractKey.SeatSlot.AREA_BUTTON, (short) i));
+            btn.transform.setPos(x, c[1], z);
+            btn.transform.setRotation(rot);
+            root.addChild(btn);
+        }
+    }
+
+    private static Component chineseActionLabel(ChinesePlayerAction a) {
+        if (a instanceof ChinesePlayerAction.Ron) return actionLabel("ron");
+        if (a instanceof ChinesePlayerAction.Tsumo) return actionLabel("tsumo");
+        if (a instanceof ChinesePlayerAction.Pon) return actionLabel("pon");
+        if (a instanceof ChinesePlayerAction.Chi) return actionLabel("chi");
+        if (a instanceof ChinesePlayerAction.Kakan
+                || a instanceof ChinesePlayerAction.Ankan
+                || a instanceof ChinesePlayerAction.Daiminkan) return actionLabel("kan");
+        if (a instanceof ChinesePlayerAction.Pass) return actionLabel("pass");
+        return Component.literal("?");
+    }
+
+    /** Billbooard result banner for a Chinese round end. */
+    private void drawChineseResult(MahjongTableBlockEntity table, ChineseMatchPhase.RoundEnded re,
+                                   PoseStack poseStack, MultiBufferSource buffers, int packedLight) {
+        List<ResultLine> lines = new java.util.ArrayList<>();
+        for (ChineseWinResult wr : re.results()) {
+            int winnerSeat = winnerSeatOfChinese(wr);
+            lines.add(new ResultLine(Component.literal(
+                    (winnerSeat >= 0 ? seatName(table, winnerSeat) + " " : "")
+                            + (wr.tsumo() ? "自摸" : "荣和")), COLOR_ROUND_TITLE));
+            for (ChineseYaku y : wr.yaku()) {
+                lines.add(new ResultLine(yakuComponent(y.name()), COLOR_YAKU_LINE));
+            }
+            lines.add(new ResultLine(Component.literal(wr.fullWin() ? "爆胡" : wr.fan() + "番"),
+                    wr.fullWin() ? COLOR_VERDICT_YAKUMAN : COLOR_VERDICT_NORMAL));
+            for (int i = 0; i < wr.pointDeltas().size(); i++) {
+                int d = wr.pointDeltas().get(i);
+                if (d == 0) continue;
+                lines.add(new ResultLine(Component.literal(seatName(table, i) + " " + (d > 0 ? "+" : "") + d),
+                        COLOR_DELTA_LINE));
+            }
+        }
+        if (lines.isEmpty()) return;
+        var mc = Minecraft.getInstance();
+        poseStack.pushPose();
+        poseStack.translate(0.5, 1.65, 0.5);
+        poseStack.mulPose(mc.getEntityRenderDispatcher().cameraOrientation());
+        poseStack.scale(-RESULT_TEXT_SCALE, -RESULT_TEXT_SCALE, RESULT_TEXT_SCALE);
+        float y = 0f;
+        for (ResultLine line : lines) {
+            int w = font.width(line.text());
+            font.drawInBatch(line.text(), -w / 2f, y, line.color(), false,
+                    poseStack.last().pose(), buffers, Font.DisplayMode.NORMAL, RESULT_TEXT_BG, packedLight);
+            y += font.lineHeight + 1f;
+        }
+        poseStack.popPose();
+    }
+
+    private static int winnerSeatOfChinese(ChineseWinResult wr) {
+        for (int i = 0; i < wr.pointDeltas().size(); i++) {
+            if (wr.pointDeltas().get(i) > 0) return i;
+        }
+        return -1;
     }
 
     /** Round-result text scale. */
@@ -739,7 +1095,7 @@ public class MahjongTableRenderer implements BlockEntityRenderer<MahjongTableBlo
             case 3 -> "riichi_mahjong_forge.result.wind.north";
             default -> null;
         };
-        return key != null ? Component.translatable(key) : Component.literal("Seat " + seat);
+        return key != null ? Component.translatable(key) : Component.literal("座位 " + (seat + 1));
     }
 
     /** Builds the localized name component for a yaku enum's raw name. Falls back
@@ -789,6 +1145,26 @@ public class MahjongTableRenderer implements BlockEntityRenderer<MahjongTableBlo
         lastObservedDealingStage = null;
         lastFrameRingStacks = 0;
         lastFrameHandTiles = 0;
+        resetChineseStaleness();
+    }
+
+    private void resetChineseStaleness() {
+        lastChineseRound = null;
+        lastChineseFacing = null;
+        lastChineseLocalSeat = -1;
+        lastChineseLocalInteractive = false;
+        lastChineseDrawnDelivered = false;
+        lastChineseInResult = false;
+        lastChineseState = null;
+        lastChineseTurnSeat = -1;
+        lastChineseClaimFromSeat = -1;
+        lastChineseClaimKind = null;
+        lastChineseActiveTile = null;
+        lastChineseWallSize = -1;
+        lastChineseWinResultsSize = -1;
+        java.util.Arrays.fill(lastChineseHandSize, -1);
+        java.util.Arrays.fill(lastChineseDiscardSize, -1);
+        java.util.Arrays.fill(lastChineseMeldSize, -1);
     }
 
     private void rebuildSceneIfStale(MahjongTableBlockEntity table, Direction facing, boolean editorActive) {
@@ -2478,6 +2854,13 @@ public class MahjongTableRenderer implements BlockEntityRenderer<MahjongTableBlo
         Component wind = seat >= 0 && seat < WIND_KEY_BY_SEAT.length
                 ? Component.translatable(WIND_KEY_BY_SEAT[seat])
                 : Component.literal("?");
+        ChineseGameDriver cd = table.chineseDriver();
+        if (cd != null) {
+            ChineseRoundState r = cd.match().currentRound();
+            if (r == null || seat >= r.playerCount()) return wind;
+            return Component.translatable("riichi_mahjong_forge.label.wind_points",
+                    wind, r.players().get(seat).points());
+        }
         if (table.driver() == null) {
             return wind;
         }
@@ -2493,7 +2876,7 @@ public class MahjongTableRenderer implements BlockEntityRenderer<MahjongTableBlo
         return info.occupant().map(uuid -> {
             Player p = level.getPlayerByUUID(uuid);
             return Component.literal(p != null ? p.getName().getString() : "(offline)");
-        }).orElse(Component.literal("BOT"));
+        }).orElse(Component.literal("机器人"));
     }
 
     private static int currentTurnSeat(MahjongTableBlockEntity table) {

@@ -2,6 +2,7 @@ package com.riichimahjongforge.cuterenderer;
 
 import com.riichimahjongforge.RiichiMahjongForgeMod;
 import com.riichimahjongforge.common.BaseMultipartBlock;
+import com.mojang.logging.LogUtils;
 import com.riichimahjongforge.cuterenderer.net.C2SCuteClickPacket;
 import com.riichimahjongforge.cuterenderer.net.CuteNetwork;
 import net.minecraft.client.Minecraft;
@@ -62,6 +63,10 @@ public final class CuteClickInputHandler {
         Interactive i = hovered.interactive();
         if (i == null) return;
 
+        if (i.key() instanceof InteractKey.SeatSlot ss
+                && ss.area() == InteractKey.SeatSlot.AREA_BUTTON) {
+            LogUtils.getLogger().info("CuteClick DEBUG: sending button click seat={} idx={}", ss.seat(), ss.index());
+        }
         CuteNetwork.CHANNEL.sendToServer(new C2SCuteClickPacket(
                 mc.level.dimension(),
                 renderer.key().masterPos(),
