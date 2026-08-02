@@ -19,6 +19,23 @@ import java.util.Optional;
  */
 public class ChineseHeuristicBot extends ChineseAbstractBot {
 
+    /** 人性化节奏：出牌/副露给足反应时间，避免 AI 秒出导致碰窗口一闪而过、
+     *  真人跟不上。比基类默认（0.15s 出牌）慢很多。 */
+    @Override
+    protected double secondsFor(ChineseDecisionRequest request) {
+        for (ChinesePlayerAction a : request.legalActions()) {
+            if (a instanceof ChinesePlayerAction.Tsumo || a instanceof ChinesePlayerAction.Ron) return 0.5;
+            if (a instanceof ChinesePlayerAction.Pon
+                    || a instanceof ChinesePlayerAction.Chi
+                    || a instanceof ChinesePlayerAction.Daiminkan) return 0.7;
+            if (a instanceof ChinesePlayerAction.Ankan || a instanceof ChinesePlayerAction.Kakan) return 0.6;
+            if (a instanceof ChinesePlayerAction.Discard) return 0.7;
+            if (a instanceof ChinesePlayerAction.Pass) return 0.5;
+            if (a instanceof ChinesePlayerAction.Draw) return 0.1;
+        }
+        return 0.2;
+    }
+
     @Override
     protected Optional<ChinesePlayerAction> pick(ChineseDecisionRequest request) {
         if (request.phase() instanceof ChineseMatchPhase.AwaitingQueYiMen) {

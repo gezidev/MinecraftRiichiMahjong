@@ -428,8 +428,8 @@ public class MahjongTableRenderer implements BlockEntityRenderer<MahjongTableBlo
      *  每帧递减，>0 时绘制「庄家 掷出 X+Y=Z · 开门 W」。本地倒计时让 AI 秒出牌
      *  也不会让窗口一闪而过。 */
     private int chineseOpeningTicksLeft;
-    /** 开局仪式浮空时长（5 秒 @20tps）。 */
-    private static final int CHINESE_OPENING_TICKS = 100;
+    /** 开局仪式浮空时长（10 秒 @20tps）。 */
+    private static final int CHINESE_OPENING_TICKS = 200;
 
     public MahjongTableRenderer(BlockEntityRendererProvider.Context ctx) {
         this.font = ctx.getFont();
@@ -769,7 +769,7 @@ public class MahjongTableRenderer implements BlockEntityRenderer<MahjongTableBlo
             // subtracted in CCW order starting at the dealer, so the wall
             // visibly depletes instead of re-slicing/jumping.
             int perSeat = Math.max(0, round.initialWallSize() / round.playerCount());
-            int seatTiles = chineseLiveTilesAfterDeal(seat, perSeat, round.dealerSeat(),
+            int seatTiles = chineseLiveTilesAfterDeal(seat, perSeat, round.breakerSeat(),
                     round.initialWallSize() - round.wallSize());
             if (seatTiles > 0) {
                 int positions = (seatTiles + 1) / 2;   // 2-tall stacks
@@ -984,9 +984,17 @@ public class MahjongTableRenderer implements BlockEntityRenderer<MahjongTableBlo
             int idx = 0;
             for (ChineseWinResult wr : results) {
                 int winnerSeat = winnerSeatOfChinese(wr);
-                lines.add(new ResultLine(Component.literal(
-                        (winnerSeat >= 0 ? seatName(table, winnerSeat) + " " : "")
-                                + (wr.tsumo() ? "自摸" : "荣和")), COLOR_ROUND_TITLE));
+                // 不能用 Component.literal(Component + String)：会把翻译组件烤成
+                // toString 的 translation(key=...) 串。改用 append 组合。
+                Component header;
+                if (winnerSeat >= 0) {
+                    header = Component.empty()
+                            .append(seatName(table, winnerSeat))
+                            .append(wr.tsumo() ? " 自摸" : " 荣和");
+                } else {
+                    header = Component.literal(wr.tsumo() ? "自摸" : "荣和");
+                }
+                lines.add(new ResultLine(header, COLOR_ROUND_TITLE));
                 // Yaku lines — progressive reveal, global cursor across all winners.
                 for (ChineseYaku y : wr.yaku()) {
                     if (idx++ >= yakuRevealed) break;
@@ -998,8 +1006,10 @@ public class MahjongTableRenderer implements BlockEntityRenderer<MahjongTableBlo
                     for (int i = 0; i < wr.pointDeltas().size(); i++) {
                         int d = wr.pointDeltas().get(i);
                         if (d == 0) continue;
-                        lines.add(new ResultLine(Component.literal(seatName(table, i) + " " + (d > 0 ? "+" : "") + d),
-                                COLOR_DELTA_LINE));
+                        Component delta = Component.empty()
+                                .append(seatName(table, i))
+                                .append(d > 0 ? " +" : " ").append(String.valueOf(d));
+                        lines.add(new ResultLine(delta, COLOR_DELTA_LINE));
                     }
                 }
             }
