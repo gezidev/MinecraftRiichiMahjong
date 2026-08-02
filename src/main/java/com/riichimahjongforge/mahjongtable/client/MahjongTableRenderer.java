@@ -424,6 +424,12 @@ public class MahjongTableRenderer implements BlockEntityRenderer<MahjongTableBlo
     private final int[] lastChineseHandSize = new int[4];
     private final int[] lastChineseDiscardSize = new int[4];
     private final int[] lastChineseMeldSize = new int[4];
+    /** 中文麻将开局仪式浮空的本地倒计时（tick）。新局（round 引用变化）时重置，
+     *  每帧递减，>0 时绘制「庄家 掷出 X+Y=Z · 开门 W」。本地倒计时让 AI 秒出牌
+     *  也不会让窗口一闪而过。 */
+    private int chineseOpeningTicksLeft;
+    /** 开局仪式浮空时长（5 秒 @20tps）。 */
+    private static final int CHINESE_OPENING_TICKS = 100;
 
     public MahjongTableRenderer(BlockEntityRendererProvider.Context ctx) {
         this.font = ctx.getFont();
@@ -582,13 +588,17 @@ public class MahjongTableRenderer implements BlockEntityRenderer<MahjongTableBlo
                     HIGHLIGHT_R, HIGHLIGHT_G, HIGHLIGHT_B, HIGHLIGHT_A);
         }
 
-        // 开局仪式：首回合（摸牌后、第一张打出前）浮空显示掷骰结果与开门方位。
-        if (!table.isInResultPhase()) {
+        // 开局仪式：新局后固定时长浮空显示掷骰结果与开门方位（客户端本地倒计时，
+        // 避免 AI 秒出牌导致窗口一闪而过）。
+        if (!table.isInResultPhase() && chineseOpeningTicksLeft > 0) {
+            chineseOpeningTicksLeft--;
             drawChineseOpeningOverlay(table, round, poseStack, buffers, packedLight);
         }
 
-        if (table.isInResultPhase() && driver.currentPhase() instanceof ChineseMatchPhase.RoundEnded re) {
-            drawChineseResult(table, re, round, poseStack, buffers, packedLight);
+        // 结算横幅：依据同步的 resultAnimStage（服务端权威）与 round.winResults()
+        // 绘制，不依赖客户端重建的 driver phase（NBT 不序列化 phase）。
+        if (table.isInResultPhase()) {
+            drawChineseResult(table, round, poseStack, buffers, packedLight);
         }
     }
 
@@ -629,6 +639,11 @@ public class MahjongTableRenderer implements BlockEntityRenderer<MahjongTableBlo
             }
         }
         if (!changed) return false;
+
+        // 新局（round 引用变化）→ 重置开局仪式浮空倒计时。
+        if (round != lastChineseRound) {
+            chineseOpeningTicksLeft = CHINESE_OPENING_TICKS;
+        }
 
         lastChineseRound = round;
         lastChineseFacing = facing;
@@ -748,19 +763,42 @@ public class MahjongTableRenderer implements BlockEntityRenderer<MahjongTableBlo
                 for (ChinesePlayerAction a : buttons) ghosts.add(chineseGhostTilesForAction(a, round));
                 buildChineseButtons(root, buttons, ghosts, seat, outward);
             }
-            // Wall — face-down stacks (WALL anchor auto-detects face-down).
-            // Each seat shows a slice of the remaining live wall.
-            int wallSize = round.wallSize();
-            int perSeat = (int) Math.ceil(wallSize / (double) round.playerCount());
-            int start = seat * perSeat;
-            int end = Math.min(wallSize, start + perSeat);
-            if (start < end) {
-                // layFlat=true → face-down stacks, same as the riichi wall.
-                root.addChild(buildLineGroup(WALL, round.wall().subList(start, end), outward, true));
+            // Wall — fixed face-down ring, consumed from the dealer's wall head
+            // (mirrors the riichi wall). Each seat keeps a fixed row of
+            // initialWallSize/playerCount tiles; taken tiles (dealt + drawn) are
+            // subtracted in CCW order starting at the dealer, so the wall
+            // visibly depletes instead of re-slicing/jumping.
+            int perSeat = Math.max(0, round.initialWallSize() / round.playerCount());
+            int seatTiles = chineseLiveTilesAfterDeal(seat, perSeat, round.dealerSeat(),
+                    round.initialWallSize() - round.wallSize());
+            if (seatTiles > 0) {
+                int positions = (seatTiles + 1) / 2;   // 2-tall stacks
+                int lastStackLayers = positions > 0 ? seatTiles - (positions - 1) * 2 : -1;
+                root.addChild(buildLineGroup(WALL,
+                        placeholderTiles(positions, FACE_DOWN_PLACEHOLDER),
+                        outward, /* layFlat= */ true,
+                        /* doraStackIdx= */ -1, /* splitAfterIdx= */ -1, /* splitGap= */ 0,
+                        /* lastStackLayers= */ lastStackLayers));
             }
             seatRoots[seat] = root;
             cute.root().addChild(root);
         }
+    }
+
+    /** 中文牌墙每座剩余张数：全墙 perSeat 张/座（无死墙），已消耗的
+     *  {@code taken}（发牌 + 摸牌）从庄家墙头起逆时针（CCW）依次扣除。 */
+    private static int chineseLiveTilesAfterDeal(int seat, int perSeat, int dealerSeat, int taken) {
+        int n = 4;
+        int[] remaining = {perSeat, perSeat, perSeat, perSeat};
+        int left = Math.max(0, taken);
+        for (int step = 0; step < n && left > 0; step++) {
+            int s = (dealerSeat + step) % n;
+            int take = Math.min(left, remaining[s]);
+            remaining[s] -= take;
+            left -= take;
+        }
+        if (seat < 0 || seat >= n) return 0;
+        return remaining[seat];
     }
 
     /** Drawn tile → on-turn seat's rightmost hand tile; claimed discard → the
@@ -786,17 +824,17 @@ public class MahjongTableRenderer implements BlockEntityRenderer<MahjongTableBlo
 
     /** Buttons for Chinese actions, laid out along the BUTTONS anchor, clickable.
      *  Each button carries a ghost-tile preview of the meld it would form
-     *  (hand tiles + the claimed/added tile), mirroring the riichi buttons. */
+     *  (hand tiles + the claimed/added tile), mirroring the riichi buttons.
+     *  Buttons are spaced by their ACTUAL plate width (ghost-space included) so
+     *  a wide 吃/杠 button never overlaps its neighbours. */
     private void buildChineseButtons(GroupNode root, List<ChinesePlayerAction> actions,
                                      List<List<TheMahjongTile>> ghosts, int seat, Direction outward) {
         if (actions.isEmpty()) return;
         Direction lineDir = outward.getCounterClockWise();
         double[] c = anchorWorldOrigin(BUTTONS, outward);
-        float spacing = Math.max(0.14f, BUTTONS.f("colSpacing"));
         // Larger, padded plates so Chinese labels are readable and clickable.
         float textScale = 0.012f;
         Quaternionf rot = baseTileRotation(BUTTONS, outward, true);
-        double start = -(actions.size() - 1) * spacing / 2.0;
 
         // Ghost-tile preview constants (mirror buildButtonsGroup / BUTTON_GHOSTS).
         Quaternionf tileRot = baseTileRotation(BUTTON_GHOSTS, outward, true);
@@ -808,10 +846,11 @@ public class MahjongTableRenderer implements BlockEntityRenderer<MahjongTableBlo
         float rightPadPerTilePx   = BUTTONS.f("rightPadPerTile");
         Direction plateRightDir   = outward.getCounterClockWise();
 
-        for (int i = 0; i < actions.size(); i++) {
-            double off = start + i * spacing;
-            double x = c[0] + lineDir.getStepX() * off;
-            double z = c[2] + lineDir.getStepZ() * off;
+        // Pass 1 — build all buttons (extraRightPad set) and record plate half-widths.
+        int n = actions.size();
+        WorldButtonNode[] btns = new WorldButtonNode[n];
+        double[] half = new double[n];
+        for (int i = 0; i < n; i++) {
             int ghostCount = (ghosts != null && i < ghosts.size()) ? ghosts.get(i).size() : 0;
             float extraRightPad = rightPadPerTilePx * ghostCount;
             WorldButtonNode btn = new WorldButtonNode(chineseActionLabel(actions.get(i)))
@@ -822,6 +861,24 @@ public class MahjongTableRenderer implements BlockEntityRenderer<MahjongTableBlo
                     .setExtraRightPad(extraRightPad)   // MUST precede makeClickable
                     .makeClickable(new InteractKey.SeatSlot(
                             (byte) seat, InteractKey.SeatSlot.AREA_BUTTON, (short) i));
+            btns[i] = btn;
+            half[i] = btn.plateHalfWidthWorld();
+        }
+
+        // Pass 2 — lay out left-edge-aligned with a fixed gap between neighbours,
+        // centred on the BUTTONS anchor. Each button centre sits at
+        // cumulativeLeft + its own half-width.
+        double gap = 0.06;
+        double total = 0;
+        for (int i = 0; i < n; i++) total += 2 * half[i];
+        total += gap * (n - 1);
+        double cursor = -total / 2.0;
+
+        for (int i = 0; i < n; i++) {
+            double off = cursor + half[i];
+            double x = c[0] + lineDir.getStepX() * off;
+            double z = c[2] + lineDir.getStepZ() * off;
+            WorldButtonNode btn = btns[i];
             btn.transform.setPos(x, c[1], z);
             btn.transform.setRotation(rot);
             root.addChild(btn);
@@ -831,13 +888,13 @@ public class MahjongTableRenderer implements BlockEntityRenderer<MahjongTableBlo
             // text+padding right edge.
             if (ghosts != null && i < ghosts.size()) {
                 List<TheMahjongTile> preview = ghosts.get(i);
-                int n = preview.size();
-                if (n > 0) {
+                int gn = preview.size();
+                if (gn > 0) {
                     double plateRightEdgeWorld = btn.plateHalfWidthWorld();
                     double ox = -outward.getStepX() * ghostOutwardOffset;
                     double oz = -outward.getStepZ() * ghostOutwardOffset;
                     Quaternionf btnInvRot = new Quaternionf(rot).invert();
-                    for (int gi = 0; gi < n; gi++) {
+                    for (int gi = 0; gi < gn; gi++) {
                         double along = plateRightEdgeWorld + gi * ghostSpacing + ghostLateral;
                         double tx = x + plateRightDir.getStepX() * along + ox;
                         double tz = z + plateRightDir.getStepZ() * along + oz;
@@ -853,6 +910,7 @@ public class MahjongTableRenderer implements BlockEntityRenderer<MahjongTableBlo
                     }
                 }
             }
+            cursor += half[i] + gap + (i + 1 < n ? half[i + 1] : 0);
         }
     }
 
@@ -896,19 +954,22 @@ public class MahjongTableRenderer implements BlockEntityRenderer<MahjongTableBlo
 
     /** Billboard result banner for a Chinese round end. Round title always shown;
      *  a 流局 shows 无胜者 (+ 全部 ±0 at final); a win shows winner header, then
-     *  yaku lines revealed progressively, then verdict + per-payer deltas at final. */
-    private void drawChineseResult(MahjongTableBlockEntity table, ChineseMatchPhase.RoundEnded re,
-                                   ChineseRoundState round,
+     *  yaku lines revealed progressively, then verdict + per-payer deltas at final.
+     *  Data comes from the synced {@link ChineseRoundState#winResults()} and the
+     *  synced reveal cursor (resultAnimStage / resultAnimYakuIdx) — never from the
+     *  client-rebuilt driver phase (NBT doesn't serialize the phase). */
+    private void drawChineseResult(MahjongTableBlockEntity table, ChineseRoundState round,
                                    PoseStack poseStack, MultiBufferSource buffers, int packedLight) {
         ResultAnimStage stage = table.resultAnimStage();
         int yakuRevealed = table.resultAnimYakuIdx();
         boolean showFinal = stage == ResultAnimStage.SHOW_FINAL || stage == ResultAnimStage.AWAITING_ADVANCE;
+        List<ChineseWinResult> results = round.winResults();
 
         List<ResultLine> lines = new java.util.ArrayList<>();
         // Round title — always shown for the duration of the overlay.
         lines.add(new ResultLine(buildChineseRoundTitle(round), COLOR_ROUND_TITLE));
 
-        if (re.results().isEmpty()) {
+        if (results.isEmpty()) {
             // 流局 — header + (at final) "all zero" verdict.
             lines.add(new ResultLine(
                     Component.translatable("riichi_mahjong_forge.result.draw.no_winner"),
@@ -921,7 +982,7 @@ public class MahjongTableRenderer implements BlockEntityRenderer<MahjongTableBlo
         } else {
             // 单胡终局 → 至多一个胜者；仍按 winner→yaku 顺序与 reveal cursor 对齐。
             int idx = 0;
-            for (ChineseWinResult wr : re.results()) {
+            for (ChineseWinResult wr : results) {
                 int winnerSeat = winnerSeatOfChinese(wr);
                 lines.add(new ResultLine(Component.literal(
                         (winnerSeat >= 0 ? seatName(table, winnerSeat) + " " : "")

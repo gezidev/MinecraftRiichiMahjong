@@ -44,6 +44,8 @@ public final class ChineseRoundState {
     /** 开局两颗骰子（1-6）。0 = legacy/无骰（发牌不跳牌）。 */
     private final int diceA;
     private final int diceB;
+    /** 整局初始牌墙张数（136 等），供渲染端按固定位置显示消耗。 */
+    private final int initialWallSize;
 
     private final List<TheMahjongTile> wall;
     private final List<ChinesePlayerState> players;
@@ -71,6 +73,7 @@ public final class ChineseRoundState {
         this.rules = rules;
         this.diceA = diceA;
         this.diceB = diceB;
+        this.initialWallSize = wallIn.size();
         this.wall = new ArrayList<>();
         this.players = new ArrayList<>();
         for (int i = 0; i < playerCount; i++) players.add(new ChinesePlayerState(startPoints.get(i)));
@@ -157,6 +160,8 @@ public final class ChineseRoundState {
     public int wonCount() { return wonCount; }
     public int wallSize() { return wall.size(); }
     public boolean wallEmpty() { return wall.isEmpty(); }
+    /** 整局初始牌墙张数（发牌前），供渲染端按固定位置显示墙消耗。 */
+    public int initialWallSize() { return initialWallSize; }
     public List<TheMahjongTile> wall() { return wall; }
     public int drawsSoFar() { return drawsSoFar; }
     public boolean anyDiscardYet() { return anyDiscardYet; }
@@ -498,6 +503,7 @@ public final class ChineseRoundState {
         this.players = players;
         this.diceA = diceA;
         this.diceB = diceB;
+        this.initialWallSize = 13 * playerCount + 1 + wall.size(); // 已发 + 余墙
         this.drawsSoFar = 1;
     }
 }
