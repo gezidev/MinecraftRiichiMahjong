@@ -27,7 +27,11 @@ import net.minecraft.world.level.block.state.BlockState;
 import net.minecraftforge.common.MinecraftForge;
 import net.minecraftforge.eventbus.api.SubscribeEvent;
 
+import org.slf4j.Logger;
+import com.mojang.logging.LogUtils;
+
 public class MahjongAltarBlockEntity extends BlockEntity implements Container {
+    private static final Logger LOGGER = LogUtils.getLogger();
     private static final int SLOT_COUNT = 9;
     private static final int EVENT_RADIUS = 8;
     private static final double EVENT_RADIUS_SQR = EVENT_RADIUS * EVENT_RADIUS;
@@ -289,16 +293,27 @@ public class MahjongAltarBlockEntity extends BlockEntity implements Container {
         if (registeredToForgeBus || !(level instanceof ServerLevel)) {
             return;
         }
-        MinecraftForge.EVENT_BUS.register(this);
-        registeredToForgeBus = true;
+        try {
+            MinecraftForge.EVENT_BUS.register(this);
+            registeredToForgeBus = true;
+        } catch (Throwable t) {
+            // EventBus.register 会对本类方法做反射签名解析（@SubscribeEvent 参数类型 +
+            // 泛型签名引用的类）。若某个可选类（如 MahjongAltarRecipe）在运行时缺失，
+            // 反射会抛 ClassNotFoundException/NoClassDefFoundError——绝不能在这里让
+            // 整个服务端在 chunk 加载时崩溃。捕获后本方块静默禁用祭坛合成功能即可。
+            LOGGER.error("MahjongAltar: 无法注册 Forge 事件监听（祭坛合成禁用）", t);
+        }
     }
 
     private void unregisterForgeListenerIfServer() {
         if (!registeredToForgeBus || !(level instanceof ServerLevel)) {
             return;
         }
-        MinecraftForge.EVENT_BUS.unregister(this);
-        registeredToForgeBus = false;
+        try {
+            MinecraftForge.EVENT_BUS.unregister(this);
+        } finally {
+            registeredToForgeBus = false;
+        }
     }
 
     private void setChangedAndSync() {

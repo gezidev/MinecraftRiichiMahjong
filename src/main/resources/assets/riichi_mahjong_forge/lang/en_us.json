@@ -26,6 +26,9 @@
   "riichi_mahjong_forge.button.action.kita": "KITA",
   "riichi_mahjong_forge.button.action.abort": "ABORT",
   "riichi_mahjong_forge.button.action.pass": "PASS",
+  "riichi_mahjong_forge.button.action.missing_man": "缺万",
+  "riichi_mahjong_forge.button.action.missing_pin": "缺筒",
+  "riichi_mahjong_forge.button.action.missing_sou": "缺条",
   "riichi_mahjong_forge.label.wind_points": "%s: %s",
   "riichi_mahjong_forge.label.dealer": "Dealer",
   "riichi_mahjong_forge.hint.player.wait_turn": "Wait for your turn.",
@@ -169,6 +172,7 @@
   "riichi_mahjong_forge.result.round_label": "%s %s",
   "riichi_mahjong_forge.result.round_label_honba": "%s %s (%s honba)",
   "riichi_mahjong_forge.result.opening_dice": "%s rolled %s + %s = %s · open at %s",
+  "riichi_mahjong_forge.result.queyimen_prompt": "Declare your missing suit — choose one to run out first",
   "riichi_mahjong_forge.result.draw.no_winner": "No winner",
   "riichi_mahjong_forge.result.draw.all_zero": "All +/-0",
   "riichi_mahjong_forge.result.verdict.han": "%s HAN",
@@ -335,5 +339,8 @@
   "riichi_mahjong_forge.yaku.di_hu": "Earthly Hand",
   "riichi_mahjong_forge.yaku.shi_san_yao": "Thirteen Orphans",
   "riichi_mahjong_forge.yaku.da_san_yuan": "Big Three Dragons",
-  "riichi_mahjong_forge.yaku.si_an_ke": "Four Concealed Triplets"
+  "riichi_mahjong_forge.yaku.si_an_ke": "Four Concealed Triplets",
+  "riichi_mahjong_forge.preset.sichuan_blood_battle_4p": "Sichuan Blood Battle",
+  "riichi_mahjong_forge.preset.dongbei_tui_dao_hu_4p": "Dongbei Tui-Dao-Hu",
+  "riichi_mahjong_forge.preset.guangdong_ji_ping_hu_4p": "Guangdong Ji-Ping-Hu"
 }

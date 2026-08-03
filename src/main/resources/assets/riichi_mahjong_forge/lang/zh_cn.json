@@ -26,6 +26,9 @@
   "riichi_mahjong_forge.button.action.kita": "北",
   "riichi_mahjong_forge.button.action.abort": "中止",
   "riichi_mahjong_forge.button.action.pass": "过",
+  "riichi_mahjong_forge.button.action.missing_man": "缺万",
+  "riichi_mahjong_forge.button.action.missing_pin": "缺筒",
+  "riichi_mahjong_forge.button.action.missing_sou": "缺条",
   "riichi_mahjong_forge.label.wind_points": "%s：%s",
   "riichi_mahjong_forge.label.dealer": "庄家",
   "riichi_mahjong_forge.hint.player.wait_turn": "请等待你的回合。",
@@ -168,6 +171,7 @@
   "riichi_mahjong_forge.result.round_label": "%s %s",
   "riichi_mahjong_forge.result.round_label_honba": "%s %s（%s 本场）",
   "riichi_mahjong_forge.result.opening_dice": "%s 掷出 %s+%s=%s · 开门 %s",
+  "riichi_mahjong_forge.result.queyimen_prompt": "请定缺：选择一门花色作为缺门（之后必须先打完该花色的牌）",
   "riichi_mahjong_forge.result.draw.no_winner": "无胜者",
   "riichi_mahjong_forge.result.draw.all_zero": "全部 ±0",
   "riichi_mahjong_forge.result.verdict.han": "%s 番",
@@ -333,5 +337,8 @@
   "riichi_mahjong_forge.yaku.di_hu": "地胡",
   "riichi_mahjong_forge.yaku.shi_san_yao": "十三幺",
   "riichi_mahjong_forge.yaku.da_san_yuan": "大三元",
-  "riichi_mahjong_forge.yaku.si_an_ke": "四暗刻"
+  "riichi_mahjong_forge.yaku.si_an_ke": "四暗刻",
+  "riichi_mahjong_forge.preset.sichuan_blood_battle_4p": "四川血战到底",
+  "riichi_mahjong_forge.preset.dongbei_tui_dao_hu_4p": "东北推倒胡",
+  "riichi_mahjong_forge.preset.guangdong_ji_ping_hu_4p": "广东鸡平胡"
 }

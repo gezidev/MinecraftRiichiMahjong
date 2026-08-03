@@ -26,7 +26,10 @@ public enum RuleSetPreset {
     WRC_4P("wrc_4p", 4, TheMahjongMatch::defaults, null),
     MAHJONG_SOUL_SANMA_3P("mahjong_soul_sanma_3p", 3, TheMahjongMatch::defaultMahjongSoulSanma, null),
     TENHOU_SANMA_3P("tenhou_sanma_3p", 3, TheMahjongMatch::defaultTenhouSanma, null),
-    MASS_MAHJONG_4P("mass_mahjong_4p", 4, null, ChineseRulePreset.MASS_MAHJONG);
+    MASS_MAHJONG_4P("mass_mahjong_4p", 4, null, ChineseRulePreset.MASS_MAHJONG),
+    SICHUAN_BLOOD_BATTLE_4P("sichuan_blood_battle_4p", 4, null, ChineseRulePreset.SICHUAN_BLOOD_BATTLE),
+    DONGBEI_TUI_DAO_HU_4P("dongbei_tui_dao_hu_4p", 4, null, ChineseRulePreset.DONGBEI_TUI_DAO_HU),
+    GUANGDONG_JI_PING_HU_4P("guangdong_ji_ping_hu_4p", 4, null, ChineseRulePreset.GUANGDONG_JI_PING_HU);
 
     private final String key;
     private final int playerCount;

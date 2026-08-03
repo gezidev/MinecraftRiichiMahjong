@@ -37,6 +37,10 @@ public class ChineseMahjongTableHumanPlayer implements ChinesePlayerInterface {
     private static final Logger LOGGER = LogUtils.getLogger();
     private final List<ChinesePlayerAction> queue = new ArrayList<>();
     private UUID occupant;
+    /** Fingerprint of the phase the queued actions were submitted in — used to
+     *  drop stale actions (e.g. a Pon queued in a claim window must not fire in
+     *  the next claim window) when the phase changes. */
+    private String queuedForPhase = "";
 
     // Delivery latches — persist across save/load so a reload mid-turn never
     // re-delivers (which would dupe items).
@@ -50,15 +54,74 @@ public class ChineseMahjongTableHumanPlayer implements ChinesePlayerInterface {
      *  point this AwaitingDiscard entry. Read by the BE to expose to the renderer. */
     public boolean drawnTileDelivered() { return drawnTileDelivered; }
 
+    private static String phaseKey(ChineseMatchPhase phase) {
+        if (phase instanceof ChineseMatchPhase.AwaitingDiscard ad) return "discard:" + ad.seat();
+        if (phase instanceof ChineseMatchPhase.AwaitingClaims ac) return "claim:" + ac.pendingSeats();
+        if (phase instanceof ChineseMatchPhase.AwaitingQueYiMen) return "queyimen";
+        return phase.getClass().getSimpleName();
+    }
+
+    private void queueAction(ChinesePlayerAction a, ChineseMatchPhase phase) {
+        String key = phaseKey(phase);
+        if (!key.equals(queuedForPhase)) {
+            queue.clear();
+            queuedForPhase = key;
+        }
+        // 去重：同一动作重复点击（如连续点碰）只入队一次，避免后续幽灵触发。
+        for (ChinesePlayerAction q : queue) {
+            if (actionsEqual(q, a)) return;
+        }
+        queue.add(a);
+    }
+
+    private static boolean actionsEqual(ChinesePlayerAction a, ChinesePlayerAction b) {
+        if (a instanceof ChinesePlayerAction.Discard d1 && b instanceof ChinesePlayerAction.Discard d2) {
+            return d1.tile().matchesSuitRank(d2.tile());
+        }
+        if (a instanceof ChinesePlayerAction.Pon p1 && b instanceof ChinesePlayerAction.Pon p2) {
+            return p1.own().size() == p2.own().size();
+        }
+        if (a instanceof ChinesePlayerAction.Chi c1 && b instanceof ChinesePlayerAction.Chi c2) {
+            return c1.own().size() == c2.own().size();
+        }
+        if (a instanceof ChinesePlayerAction.DeclareMissingSuit m1
+                && b instanceof ChinesePlayerAction.DeclareMissingSuit m2) {
+            return m1.missing() == m2.missing();
+        }
+        if (a instanceof ChinesePlayerAction.Tsumo && b instanceof ChinesePlayerAction.Tsumo) return true;
+        if (a instanceof ChinesePlayerAction.Ron && b instanceof ChinesePlayerAction.Ron) return true;
+        if (a instanceof ChinesePlayerAction.Pass && b instanceof ChinesePlayerAction.Pass) return true;
+        if (a instanceof ChinesePlayerAction.Draw && b instanceof ChinesePlayerAction.Draw) return true;
+        return false;
+    }
+
     @Override
     public Optional<ChinesePlayerAction> chooseAction(ChineseDecisionRequest request, double deltaSeconds) {
         if (request.phase() instanceof ChineseMatchPhase.AwaitingQueYiMen) {
-            return Optional.of(pickMissing(request));
+            // 定缺必须由玩家手动选择（点 缺万/缺筒/缺条 按钮）；未选择则等待，
+            // 否则自动选会让人在开局完全不知道为何只能打某花色。
+            for (int i = 0; i < queue.size(); i++) {
+                ChinesePlayerAction a = queue.get(i);
+                if (a instanceof ChinesePlayerAction.DeclareMissingSuit
+                        && request.legalActions().contains(a)) {
+                    queue.remove(i);
+                    return Optional.of(a);
+                }
+            }
+            return Optional.empty();
         }
         if (request.phase() instanceof ChineseMatchPhase.AwaitingDraw ad) {
             return ad.seat() == request.seat()
                     ? Optional.of(new ChinesePlayerAction.Draw())
                     : Optional.empty();
+        }
+        // Drop stale queued actions when the phase changed since they were
+        // submitted (a Pon from a finished claim window must not fire in the
+        // next one).
+        String nowKey = phaseKey(request.phase());
+        if (!nowKey.equals(queuedForPhase)) {
+            queue.clear();
+            queuedForPhase = nowKey;
         }
         if (request.phase() instanceof ChineseMatchPhase.AwaitingClaims) {
             // Nothing claimable → auto-pass so the game doesn't stall on a manual click.
@@ -86,24 +149,6 @@ public class ChineseMahjongTableHumanPlayer implements ChinesePlayerInterface {
             }
         }
         return Optional.empty();
-    }
-
-    private static ChinesePlayerAction pickMissing(ChineseDecisionRequest request) {
-        List<TheMahjongTile> hand = request.round().players().get(request.seat()).currentHand();
-        int man = 0, pin = 0, sou = 0;
-        for (TheMahjongTile t : hand) {
-            switch (t.suit()) {
-                case MANZU -> man++;
-                case PINZU -> pin++;
-                case SOUZU -> sou++;
-                default -> {}
-            }
-        }
-        TheMahjongTile.Suit miss;
-        if (man <= pin && man <= sou) miss = TheMahjongTile.Suit.MANZU;
-        else if (pin <= sou) miss = TheMahjongTile.Suit.PINZU;
-        else miss = TheMahjongTile.Suit.SOUZU;
-        return new ChinesePlayerAction.DeclareMissingSuit(miss);
     }
 
     // ---- anti-dupe / delivery ----------------------------------------------
@@ -260,28 +305,41 @@ public class ChineseMahjongTableHumanPlayer implements ChinesePlayerInterface {
         ChineseRoundState round = driver.match().currentRound();
         if (round == null) return;
         if (ss.area() == InteractKey.SeatSlot.AREA_HAND) {
-            List<TheMahjongTile> hand = round.handDisplayOrder(seatIndex);
+            // 与服务端渲染一致：若摸到的牌已投递到玩家物品栏，从显示中剔除再映射点击。
+            List<TheMahjongTile> hand = displayHand(round, seatIndex, drawnTileDelivered);
             int idx = ss.index();
             if (idx < 0 || idx >= hand.size()) return;
             tryDiscard(sender, hand.get(idx), driver, seatIndex);
         } else if (ss.area() == InteractKey.SeatSlot.AREA_BUTTON) {
             List<ChinesePlayerAction> buttons = chineseTableButtons(driver, seatIndex);
             int idx = ss.index();
-            if (idx < 0 || idx >= buttons.size()) {
-                LOGGER.info("CuteClick DEBUG: button idx {} out of range ({} buttons)", idx, buttons.size());
-                return;
-            }
+            if (idx < 0 || idx >= buttons.size()) return;
             tryQueueButtonAction(sender, buttons.get(idx), driver, seatIndex);
         }
     }
 
-    /** RMB: pass a claim, or discard the just-drawn tile. */
+    /** 显示用手牌列表：排序后，若刚摸的牌已投递到物品栏则按值剔除（显示 13 张，
+     *  与玩家手里物理持有一致）。点击索引与渲染一一对应。 */
+    public static List<TheMahjongTile> displayHand(ChineseRoundState round, int seat, boolean drawnDelivered) {
+        List<TheMahjongTile> hand = new ArrayList<>(round.handDisplayOrder(seat));
+        if (drawnDelivered
+                && round.state() == ChineseRoundState.State.AWAITING_DISCARD
+                && round.lastDrawSeat() == seat
+                && round.activeTile() != null) {
+            TheMahjongTile drawn = round.activeTile();
+            hand.removeIf(t -> t.matchesSuitRank(drawn));
+        }
+        return hand;
+    }
+
+    /** RMB: discard the just-drawn tile. Note: we deliberately do NOT auto-pass a
+     *  claim on RMB — a right-click that misses a button (hover failed) would
+     *  silently pass, which reads as "the button doesn't work". Use the 过 button. */
     public void onTableRightClick(ChineseGameDriver driver, ChineseMatchPhase phase, int seatIndex, ServerPlayer sender) {
-        if (phase instanceof ChineseMatchPhase.AwaitingClaims) {
-            queue.add(new ChinesePlayerAction.Pass());
-        } else if (phase instanceof ChineseMatchPhase.AwaitingDiscard ad && ad.seat() == seatIndex) {
+        if (phase instanceof ChineseMatchPhase.AwaitingDiscard ad && ad.seat() == seatIndex) {
             ChineseRoundState round = driver.match().currentRound();
-            if (round != null && round.activeTile() != null) {
+            // 只允许打"刚摸的牌"（activeTile 是摸牌，且确实是本座摸的）。
+            if (round != null && round.activeTile() != null && round.lastDrawSeat() == seatIndex) {
                 tryDiscard(sender, round.activeTile(), driver, seatIndex);
             }
         }
@@ -315,7 +373,7 @@ public class ChineseMahjongTableHumanPlayer implements ChinesePlayerInterface {
             }
             pendingConsume = round.activeTile();
         }
-        queue.add(candidate);
+        queueAction(candidate, driver.currentPhase());
     }
 
     /**
@@ -328,7 +386,7 @@ public class ChineseMahjongTableHumanPlayer implements ChinesePlayerInterface {
                                       ChineseGameDriver driver, int seatIndex) {
         ChineseRoundState round = driver.match().currentRound();
         if (round == null) {
-            queue.add(action);
+            queueAction(action, driver.currentPhase());
             return;
         }
         boolean ourDiscardTurn =
@@ -343,7 +401,7 @@ public class ChineseMahjongTableHumanPlayer implements ChinesePlayerInterface {
             }
             pendingConsume = round.activeTile();
         }
-        queue.add(action);
+        queueAction(action, driver.currentPhase());
     }
 
     /**
@@ -353,6 +411,10 @@ public class ChineseMahjongTableHumanPlayer implements ChinesePlayerInterface {
     public static List<ChinesePlayerAction> chineseTableButtons(ChineseGameDriver driver, int seat) {
         List<ChinesePlayerAction> legal = driver.legalActions(seat);
         List<ChinesePlayerAction> out = new ArrayList<>(legal.size());
+        // 定缺（四川开局）：缺万/缺筒/缺条 三选一，排在最前。
+        for (ChinesePlayerAction a : legal) {
+            if (a instanceof ChinesePlayerAction.DeclareMissingSuit) out.add(a);
+        }
         boolean hasClaim = false;
         for (ChinesePlayerAction a : legal) {
             if (!(a instanceof ChinesePlayerAction.Pass)) { hasClaim = true; break; }

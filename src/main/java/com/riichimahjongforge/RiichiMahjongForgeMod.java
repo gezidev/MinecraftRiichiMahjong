@@ -54,7 +54,6 @@ import org.slf4j.Logger;
 public class RiichiMahjongForgeMod {
     public static final String MODID = "riichi_mahjong_forge";
     private static final Logger LOGGER = LogUtils.getLogger();
-
     public static final DeferredRegister<Block> BLOCKS = DeferredRegister.create(ForgeRegistries.BLOCKS, MODID);
     public static final DeferredRegister<Item> ITEMS = DeferredRegister.create(ForgeRegistries.ITEMS, MODID);
     public static final DeferredRegister<BlockEntityType<?>> BLOCK_ENTITY_TYPES =

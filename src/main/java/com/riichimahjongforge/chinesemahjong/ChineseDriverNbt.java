@@ -28,6 +28,7 @@ public final class ChineseDriverNbt {
         tag.putInt("version", 1);
         tag.putString("preset", match.preset().name());
         tag.putInt("playerCount", match.playerCount());
+        tag.putBoolean("endedFinalized", driver.endedFinalized());
         ListTag rounds = new ListTag();
         for (ChineseRoundState r : match.completedRounds()) rounds.add(writeRound(r));
         tag.put("completedRounds", rounds);
@@ -53,6 +54,7 @@ public final class ChineseDriverNbt {
             match.restoreRound(readRound(tag.getCompound("round"), match));
         }
         ChineseGameDriver driver = new ChineseGameDriver(match, players, random);
+        if (tag.contains("endedFinalized")) driver.setEndedFinalized(tag.getBoolean("endedFinalized"));
         driver.restorePhase();
         return driver;
     }
@@ -65,6 +67,8 @@ public final class ChineseDriverNbt {
         t.putInt("dealerSeat", r.dealerSeat());
         t.putString("roundWind", r.roundWind().name());
         t.putInt("handNumber", r.handNumber());
+        t.putInt("version", r.version());
+        t.putInt("initialWallSize", r.initialWallSize());
         t.putInt("currentTurnSeat", r.currentTurnSeat());
         t.putInt("claimFromSeat", r.claimFromSeat());
         t.putInt("lastDrawSeat", r.lastDrawSeat());
@@ -76,6 +80,11 @@ public final class ChineseDriverNbt {
         t.putBoolean("kanDiscardPending", r.kanDiscardPending());
         t.putBoolean("lastDrawWasWallEnd", r.lastDrawWasWallEnd());
         t.putBoolean("lastDiscardWasWallEnd", r.lastDiscardWasWallEnd());
+        t.putString("claimKind", r.claimKind().name());
+        t.putInt("kanRobSeat", r.kanRobSeat());
+        t.putInt("afterKanSeat", r.afterKanSeat());
+        if (r.kanRobPon() != null) t.put("kanRobPon", writeMeld(r.kanRobPon()));
+        if (r.kanRobAdded() != null) t.put("kanRobAdded", MatchNbt.writeTile(r.kanRobAdded()));
         if (r.activeTile() != null) t.put("activeTile", MatchNbt.writeTile(r.activeTile()));
         t.put("wall", MatchNbt.writeTileList(r.wall()));
         ListTag players = new ListTag();
@@ -94,10 +103,11 @@ public final class ChineseDriverNbt {
         List<ChineseWinResult> wins = new ArrayList<>();
         ListTag wt = t.getList("winResults", Tag.TAG_COMPOUND);
         for (int i = 0; i < wt.size(); i++) wins.add(readWinResult(wt.getCompound(i)));
-        return ChineseRoundState.restore(
+        List<TheMahjongTile> wallList = MatchNbt.readTileList(t.getList("wall", Tag.TAG_COMPOUND));
+        ChineseRoundState round = ChineseRoundState.restore(
                 match.playerCount(), t.getInt("dealerSeat"),
                 TheMahjongTile.Wind.valueOf(t.getString("roundWind")), t.getInt("handNumber"),
-                MatchNbt.readTileList(t.getList("wall", Tag.TAG_COMPOUND)), match.rules(),
+                wallList, match.rules(),
                 players, ChineseRoundState.State.valueOf(t.getString("state")),
                 t.getInt("currentTurnSeat"), t.getInt("claimFromSeat"),
                 t.contains("activeTile") ? MatchNbt.readTile(t.getCompound("activeTile")) : null,
@@ -107,6 +117,30 @@ public final class ChineseDriverNbt {
                 t.getBoolean("anyDiscardYet"), t.getBoolean("kanDiscardPending"),
                 t.getBoolean("lastDrawWasWallEnd"), t.getBoolean("lastDiscardWasWallEnd"),
                 wins);
+        // Claim window / kan state (added 0.3.3+). Legacy saves default to NONE.
+        ChineseRoundState.ClaimKind kind;
+        try {
+            kind = ChineseRoundState.ClaimKind.valueOf(t.getString("claimKind"));
+        } catch (IllegalArgumentException ignored) {
+            kind = ChineseRoundState.ClaimKind.NONE;
+        }
+        TheMahjongMeld.Pon kanRobPon = t.contains("kanRobPon")
+                ? (TheMahjongMeld.Pon) readMeld(t.getCompound("kanRobPon"))
+                : null;
+        TheMahjongTile kanRobAdded = t.contains("kanRobAdded")
+                ? MatchNbt.readTile(t.getCompound("kanRobAdded"))
+                : null;
+        round.restoreClaimWindow(kind,
+                t.contains("kanRobSeat") ? t.getInt("kanRobSeat") : -1,
+                kanRobPon, kanRobAdded,
+                t.contains("afterKanSeat") ? t.getInt("afterKanSeat") : -1);
+        if (t.contains("version")) round.restoreVersion(t.getInt("version"));
+        // 初始墙张数：新存档直接读持久化值；旧存档按「余墙 + 已发(13N+1) + 已摸(drawsSoFar-1)」反推。
+        int initialWall = t.contains("initialWallSize")
+                ? t.getInt("initialWallSize")
+                : wallList.size() + 13 * match.playerCount() + t.getInt("drawsSoFar");
+        round.restoreInitialWallSize(initialWall);
+        return round;
     }
 
     // ── Player ───────────────────────────────────────────────────────────

@@ -548,6 +548,7 @@ public class MahjongTableBlockEntity extends BlockEntity implements Container, M
         }
         if (state != State.GAME) return;
         this.driver = null;
+        this.chineseDriver = null;
         this.randomSeed = 0L;
         this.state = State.IDLE;
         markChangedAndSynced();
@@ -623,11 +624,6 @@ public class MahjongTableBlockEntity extends BlockEntity implements Container, M
         ChineseRoundState round = chineseDriver.match().currentRound();
         if (round == null) return;
         if (level != null) lastCuteClickGameTime = level.getGameTime();
-        if (key instanceof com.riichimahjongforge.cuterenderer.InteractKey.SeatSlot ss
-                && ss.area() == com.riichimahjongforge.cuterenderer.InteractKey.SeatSlot.AREA_BUTTON) {
-            org.slf4j.LoggerFactory.getLogger("ChinClick").info("server got button click seat={} idx={} phase={}",
-                    ss.seat(), ss.index(), chineseDriver.currentPhase());
-        }
         human.onCuteClick(key, chineseDriver, seat, player);
         markChangedAndSynced();
     }
@@ -1016,7 +1012,12 @@ public class MahjongTableBlockEntity extends BlockEntity implements Container, M
             return;
         }
         boolean renchan = computeRenchan(re);
-        int nextHonba = 0; // simple default; honba progression rules TBD
+        // 本场数：连庄（庄家和牌/听牌流局）时 +1，否则 0。从当前局的 honba 递增。
+        int nextHonba = 0;
+        if (renchan) {
+            var curRound = driver.match().currentRound();
+            if (curRound.isPresent()) nextHonba = curRound.get().honba() + 1;
+        }
         clearResultAnimState();
         try {
             driver.advanceRound(renchan, nextHonba);
@@ -1027,15 +1028,22 @@ public class MahjongTableBlockEntity extends BlockEntity implements Container, M
         markChangedAndSynced();
     }
 
+    /** 连庄判定：和牌则庄家胜；流局（无和牌）则庄家听牌连庄（Tenhou 规则）。 */
     private boolean computeRenchan(MatchPhase.RoundEnded re) {
         var roundOpt = driver.match().currentRound();
-        if (roundOpt.isEmpty() || re.winResults().isEmpty()) return false;
-        var primary = re.winResults().get(0);
-        int winnerSeat = -1;
-        for (int i = 0; i < primary.pointDeltas().size(); i++) {
-            if (primary.pointDeltas().get(i) > 0) { winnerSeat = i; break; }
+        if (roundOpt.isEmpty()) return false;
+        var round = roundOpt.get();
+        if (!re.winResults().isEmpty()) {
+            var primary = re.winResults().get(0);
+            int winnerSeat = -1;
+            for (int i = 0; i < primary.pointDeltas().size(); i++) {
+                if (primary.pointDeltas().get(i) > 0) { winnerSeat = i; break; }
+            }
+            return winnerSeat >= 0 && winnerSeat == round.dealerSeat();
         }
-        return winnerSeat >= 0 && winnerSeat == roundOpt.get().dealerSeat();
+        // 流局：庄家听牌 → 连庄。
+        return round.dealerSeat() < round.players().size()
+                && com.themahjong.yaku.TenpaiChecker.inTenpai(round.players().get(round.dealerSeat()));
     }
 
     private void clearResultAnimState() {
@@ -1343,6 +1351,26 @@ public class MahjongTableBlockEntity extends BlockEntity implements Container, M
                 preset = RuleSetPreset.MAHJONG_SOUL_4P;
             }
         }
+        if (state == State.GAME && tag.contains(NBT_SEATS, Tag.TAG_LIST)) {
+            // Fallback guard for the driver-reconstruction branches below: both
+            // need the loaded seats to place humans correctly. See NBT_SEATS load.
+        }
+        if (tag.contains(NBT_SEATS, Tag.TAG_LIST)) {
+            ListTag seatsTag = tag.getList(NBT_SEATS, Tag.TAG_COMPOUND);
+            List<SeatInfo> loaded = new ArrayList<>(seatsTag.size());
+            for (int i = 0; i < seatsTag.size(); i++) {
+                CompoundTag entry = seatsTag.getCompound(i);
+                // Legacy format: presence of "type" (BOT|HUMAN) implies enabled=true.
+                boolean enabled = entry.contains(NBT_SEAT_ENABLED)
+                        ? entry.getBoolean(NBT_SEAT_ENABLED)
+                        : entry.contains(NBT_SEAT_LEGACY_TYPE);
+                UUID uuid = entry.hasUUID(NBT_SEAT_OCCUPANT) ? entry.getUUID(NBT_SEAT_OCCUPANT) : null;
+                loaded.add(new SeatInfo(enabled, enabled ? Optional.ofNullable(uuid) : Optional.empty()));
+            }
+            seats = loaded;
+        }
+        if (seats.isEmpty()) seats = defaultSeats();
+
         if (state == State.GAME && tag.contains(NBT_CHINESE_DRIVER, Tag.TAG_COMPOUND)) {
             this.randomSeed = tag.getLong(NBT_RANDOM_SEED);
             padSeatsAtLeast(DEFAULT_SEAT_COUNT);
@@ -1371,22 +1399,11 @@ public class MahjongTableBlockEntity extends BlockEntity implements Container, M
                 }
             }
         }
-
-        if (tag.contains(NBT_SEATS, Tag.TAG_LIST)) {
-            ListTag seatsTag = tag.getList(NBT_SEATS, Tag.TAG_COMPOUND);
-            List<SeatInfo> loaded = new ArrayList<>(seatsTag.size());
-            for (int i = 0; i < seatsTag.size(); i++) {
-                CompoundTag entry = seatsTag.getCompound(i);
-                // Legacy format: presence of "type" (BOT|HUMAN) implies enabled=true.
-                boolean enabled = entry.contains(NBT_SEAT_ENABLED)
-                        ? entry.getBoolean(NBT_SEAT_ENABLED)
-                        : entry.contains(NBT_SEAT_LEGACY_TYPE);
-                UUID uuid = entry.hasUUID(NBT_SEAT_OCCUPANT) ? entry.getUUID(NBT_SEAT_OCCUPANT) : null;
-                loaded.add(new SeatInfo(enabled, enabled ? Optional.ofNullable(uuid) : Optional.empty()));
-            }
-            seats = loaded;
+        if (state == State.GAME && !tag.contains(NBT_CHINESE_DRIVER, Tag.TAG_COMPOUND)
+                && !tag.contains(NBT_DRIVER, Tag.TAG_COMPOUND)) {
+            // GAME flag with no driver tag — corrupt/legacy; bail to IDLE.
+            state = State.IDLE;
         }
-        if (seats.isEmpty()) seats = defaultSeats();
 
         inventory.clear();
         if (tag.contains(NBT_INVENTORY, Tag.TAG_LIST)) {
@@ -1431,8 +1448,9 @@ public class MahjongTableBlockEntity extends BlockEntity implements Container, M
                     }
                 }
             }
-        } else if (state == State.GAME) {
+        } else if (state == State.GAME && chineseDriver == null) {
             // GAME flag without driver tag — corrupt/legacy state; bail to IDLE.
+            // (Chinese driver reconstruction already handled above.)
             state = State.IDLE;
         }
     }

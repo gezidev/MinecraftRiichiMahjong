@@ -408,7 +408,7 @@ public class MahjongTableRenderer implements BlockEntityRenderer<MahjongTableBlo
     // reused for an entire deal — unlike the immutable riichi round, the round
     // reference alone can't gate the rebuild (the scene would freeze mid-deal).
     // We therefore key on the observable mutable state the scene renders.
-    @Nullable private ChineseRoundState lastChineseRound;
+    private int lastChineseVersion = -1;
     @Nullable private Direction lastChineseFacing;
     private int lastChineseLocalSeat = -1;
     private boolean lastChineseLocalInteractive;
@@ -419,17 +419,33 @@ public class MahjongTableRenderer implements BlockEntityRenderer<MahjongTableBlo
     private int lastChineseClaimFromSeat;
     private ChineseRoundState.ClaimKind lastChineseClaimKind;
     @Nullable private TheMahjongTile lastChineseActiveTile;
-    private int lastChineseWallSize;
-    private int lastChineseWinResultsSize;
-    private final int[] lastChineseHandSize = new int[4];
-    private final int[] lastChineseDiscardSize = new int[4];
-    private final int[] lastChineseMeldSize = new int[4];
-    /** 中文麻将开局仪式浮空的本地倒计时（tick）。新局（round 引用变化）时重置，
-     *  每帧递减，>0 时绘制「庄家 掷出 X+Y=Z · 开门 W」。本地倒计时让 AI 秒出牌
-     *  也不会让窗口一闪而过。 */
-    private int chineseOpeningTicksLeft;
-    /** 开局仪式浮空时长（10 秒 @20tps）。 */
-    private static final int CHINESE_OPENING_TICKS = 200;
+    private int lastChineseWallSize = -1;
+    private int lastChineseWinResultsSize = -1;
+    private int lastChineseHandNumber = -1;
+    private final int[] lastChineseHandSize = new int[]{-1, -1, -1, -1};
+    private final int[] lastChineseDiscardSize = new int[]{-1, -1, -1, -1};
+    private final int[] lastChineseMeldSize = new int[]{-1, -1, -1, -1};
+    /** 中文麻将开局仪式浮空的本地截止时刻（System.nanoTime）。新局（round 版本回退
+     *  或 handNumber 变化）时重置，未到期即绘制「庄家 掷出 X+Y=Z · 开门 W」。
+     *  用真实时间而非帧计数——高帧率下帧计数会让 10 秒窗口 1 秒就耗尽。 */
+    private long chineseOpeningDeadlineNanos = -1L;
+    /** 开局仪式浮空时长（8 秒）。 */
+    private static final long CHINESE_OPENING_NANOS = 8_000_000_000L;
+
+    // ── 中文开场发牌动画（本地真实时钟）────────────────────────────────────
+    // 镜像日麻的 Dealing 阶段：阶段1 墙面逐叠建立，阶段2 各家手牌逐张发出。
+    // 纯客户端美化，服务端发牌瞬间完成，动画只在开局窗口播放。动画期间强制
+    // 每帧重建场景，结束后回到版本驱动的重建。
+    private long chineseDealAnimStartNanos = -1L;
+    private int chineseDealAnimHandNumber = -1;
+    private int lastChineseAnimWallRevealed;
+    private int lastChineseAnimHandRevealed;
+    /** 墙建造阶段时长（秒，纳秒）。 */
+    private static final long CHINESE_DEAL_WALL_NANOS = 1_400_000_000L;
+    /** 手牌发出阶段时长（秒，纳秒）。 */
+    private static final long CHINESE_DEAL_HANDS_NANOS = 1_400_000_000L;
+    private static final long CHINESE_DEAL_TOTAL_NANOS =
+            CHINESE_DEAL_WALL_NANOS + CHINESE_DEAL_HANDS_NANOS;
 
     public MahjongTableRenderer(BlockEntityRendererProvider.Context ctx) {
         this.font = ctx.getFont();
@@ -588,11 +604,23 @@ public class MahjongTableRenderer implements BlockEntityRenderer<MahjongTableBlo
                     HIGHLIGHT_R, HIGHLIGHT_G, HIGHLIGHT_B, HIGHLIGHT_A);
         }
 
-        // 开局仪式：新局后固定时长浮空显示掷骰结果与开门方位（客户端本地倒计时，
-        // 避免 AI 秒出牌导致窗口一闪而过）。
-        if (!table.isInResultPhase() && chineseOpeningTicksLeft > 0) {
-            chineseOpeningTicksLeft--;
+        // 开局仪式：新局后固定时长浮空显示掷骰结果与开门方位（客户端本地计时，
+        // 避免 AI 秒出牌导致窗口一闪而过；真实时钟而非帧计数，防高帧率提前结束）。
+        if (!table.isInResultPhase()
+                && chineseOpeningDeadlineNanos > 0
+                && System.nanoTime() < chineseOpeningDeadlineNanos) {
             drawChineseOpeningOverlay(table, round, poseStack, buffers, packedLight);
+        }
+
+        // 定缺提示（四川开局）：本地玩家尚未定缺时，桌面中心下方显示指引，
+        // 让玩家知道开局要选一门缺门花色（否则会以为"只能打某几张牌"是 bug）。
+        if (!table.isInResultPhase()
+                && round.state() == ChineseRoundState.State.AWAITING_QUE_YI_MEN) {
+            int localSeat = localSeat(table);
+            if (localSeat >= 0 && localSeat < round.playerCount()
+                    && round.players().get(localSeat).missingSuit() == null) {
+                drawChineseQueYiMenPrompt(poseStack, buffers, packedLight);
+            }
         }
 
         // 结算横幅：依据同步的 resultAnimStage（服务端权威）与 round.winResults()
@@ -602,11 +630,27 @@ public class MahjongTableRenderer implements BlockEntityRenderer<MahjongTableBlo
         }
     }
 
+    /** 定缺指引浮空：本地玩家尚未选缺门时显示「请定缺：选择一门花色作为缺门，
+     *  之后必须先打完该花色的牌」。与开局骰子浮空错开高度，二者可同时显示。 */
+    private void drawChineseQueYiMenPrompt(PoseStack poseStack, MultiBufferSource buffers, int packedLight) {
+        Component line = Component.translatable("riichi_mahjong_forge.result.queyimen_prompt");
+        var mc = Minecraft.getInstance();
+        poseStack.pushPose();
+        poseStack.translate(0.5, 1.58, 0.5);
+        poseStack.mulPose(mc.getEntityRenderDispatcher().cameraOrientation());
+        poseStack.scale(-RESULT_TEXT_SCALE, -RESULT_TEXT_SCALE, RESULT_TEXT_SCALE);
+        int w = font.width(line);
+        font.drawInBatch(line, -w / 2f, 0f, 0xFFFFFFCC, false,
+                poseStack.last().pose(), buffers, Font.DisplayMode.NORMAL, RESULT_TEXT_BG, packedLight);
+        poseStack.popPose();
+    }
+
     /** Rebuilds the Chinese scene iff any observable state changed. Returns
      *  whether a rebuild happened. Every scene-relevant mutation moves at least
      *  one of the keyed fields, so the cached scene never goes stale mid-deal. */
     private boolean rebuildChineseSceneIfStale(MahjongTableBlockEntity table, ChineseRoundState round,
                                                Direction facing, ChineseGameDriver driver) {
+        Level level = table.getLevel();
         int localSeat = localSeat(table);
         boolean localInteractive = localSeat >= 0 && localSeat < round.playerCount()
                 && (round.state() == ChineseRoundState.State.AWAITING_DISCARD
@@ -614,7 +658,9 @@ public class MahjongTableRenderer implements BlockEntityRenderer<MahjongTableBlo
                 && round.currentTurnSeat() == localSeat;
         boolean drawnDelivered = localSeat >= 0 && table.drawnTileDeliveredForSeat(localSeat);
         boolean inResult = table.isInResultPhase();
-        boolean changed = round != lastChineseRound
+        // 用 round.version()（服务器每次状态变更自增）判断变化，而非引用相等——
+        // 客户端每次 NBT 同步都会重建 ChineseRoundState 实例，引用比较会每帧重建。
+        boolean changed = round.version() != lastChineseVersion
                 || facing != lastChineseFacing
                 || localSeat != lastChineseLocalSeat
                 || localInteractive != lastChineseLocalInteractive
@@ -638,14 +684,73 @@ public class MahjongTableRenderer implements BlockEntityRenderer<MahjongTableBlo
                 }
             }
         }
+        // 发牌动画进行中 → 每帧重建，让本地时钟驱动的逐叠/逐张揭示动起来。
+        if (chineseDealAnimating(round)) changed = true;
         if (!changed) return false;
 
-        // 新局（round 引用变化）→ 重置开局仪式浮空倒计时。
-        if (round != lastChineseRound) {
-            chineseOpeningTicksLeft = CHINESE_OPENING_TICKS;
+        // 新局（首见、版本回退或 handNumber 变化）→ 重置开局仪式浮空 + 发牌动画。
+        boolean newRound = lastChineseVersion < 0
+                || round.version() < lastChineseVersion
+                || round.handNumber() != lastChineseHandNumber;
+        if (newRound) {
+            chineseOpeningDeadlineNanos = System.nanoTime() + CHINESE_OPENING_NANOS;
+            // 发牌动画只在真正的开局播（drawsSoFar <= 2）——对局中途读档
+            // （drawsSoFar 已增大）不重播，避免把进行中的局面再演一遍发牌。
+            if (round.drawsSoFar() <= 2) {
+                chineseDealAnimStartNanos = System.nanoTime();
+                chineseDealAnimHandNumber = round.handNumber();
+                lastChineseAnimWallRevealed = 0;
+                lastChineseAnimHandRevealed = 0;
+            }
+        }
+        lastChineseHandNumber = round.handNumber();
+
+        // 音效（客户端本地）：普通对局按观察到的增量触发 出牌/碰杠/摸牌 点击音；
+        // 发牌动画期间改为按揭示进度触发 建墙/发牌 点击音（逐叠逐张）。
+        boolean animating = chineseDealAnimating(round);
+        if (animating) {
+            float[] prog = chineseDealProgress(round);
+            int wallTotal = round.initialWallSize();
+            int wallNow = (int) Math.round(wallTotal * prog[0]);
+            int handTotal = 0;
+            for (int s = 0; s < round.playerCount(); s++) {
+                handTotal += round.players().get(s).currentHand().size();
+            }
+            int handNow = (int) Math.round(handTotal * prog[1]);
+            if (wallNow > lastChineseAnimWallRevealed) {
+                lastChineseAnimWallRevealed = wallNow;
+                playClickSound(level, table.getBlockPos(),
+                        RiichiMahjongForgeMod.TILE_PLACE_SOUND.get(), 0.4f);
+            }
+            if (handNow > lastChineseAnimHandRevealed) {
+                lastChineseAnimHandRevealed = handNow;
+                playClickSound(level, table.getBlockPos(),
+                        RiichiMahjongForgeMod.TILE_PLACE_SOUND.get(), 0.45f);
+            }
+        } else {
+            // 首次观测（lastChineseWallSize == -1）不触发——避免一开局把所有已出牌
+            // 和已摸牌一次性播一遍。
+            boolean chinesePlayDiscard = false;
+            boolean chinesePlayMeld = false;
+            boolean chinesePlayDraw = false;
+            for (int seat = 0; seat < round.playerCount(); seat++) {
+                ChinesePlayerState p = round.players().get(seat);
+                if (lastChineseDiscardSize[seat] >= 0
+                        && p.discards().size() > lastChineseDiscardSize[seat]) chinesePlayDiscard = true;
+                if (lastChineseMeldSize[seat] >= 0
+                        && p.melds().size() > lastChineseMeldSize[seat]) chinesePlayMeld = true;
+            }
+            if (lastChineseWallSize >= 0 && round.wallSize() < lastChineseWallSize) chinesePlayDraw = true;
+            if (chinesePlayDiscard || chinesePlayMeld) {
+                playClickSound(level, table.getBlockPos(),
+                        RiichiMahjongForgeMod.TILE_PLACE_SOUND.get(), 0.55f);
+            } else if (chinesePlayDraw) {
+                playClickSound(level, table.getBlockPos(),
+                        RiichiMahjongForgeMod.TILE_PLACE_SOUND.get(), 0.35f);
+            }
         }
 
-        lastChineseRound = round;
+        lastChineseVersion = round.version();
         lastChineseFacing = facing;
         lastChineseLocalSeat = localSeat;
         lastChineseLocalInteractive = localInteractive;
@@ -679,9 +784,14 @@ public class MahjongTableRenderer implements BlockEntityRenderer<MahjongTableBlo
 
     /** Builds every seat's hand / river / melds / buttons / wall from
      *  {@link ChineseRoundState}. Strips the delivered drawn tile from the local
-     *  hand and collects orange-highlight nodes (legal discards + active tile). */
+     *  hand and collects orange-highlight nodes (legal discards + active tile).
+     *  During the local deal animation ({@link #chineseDealAnimating}) the wall
+     *  builds then hands deal progressively; buttons / interaction / highlights
+     *  are suppressed so the opening reads as a clean ceremony. */
     private void buildChineseScene(MahjongTableBlockEntity table, ChineseRoundState round, Direction facing,
                                    ChineseGameDriver driver, int localSeat) {
+        boolean dealAnim = chineseDealAnimating(round);
+        float[] dealProg = chineseDealProgress(round);
         ActiveHighlight highlight = chineseActiveHighlight(round);
         for (int seat = 0; seat < round.playerCount(); seat++) {
             Direction outward = outwardForSeat(seat, facing);
@@ -689,24 +799,23 @@ public class MahjongTableRenderer implements BlockEntityRenderer<MahjongTableBlo
             ChinesePlayerState p = round.players().get(seat);
             GroupNode root = new GroupNode();
 
-            // Hand (standing, face-up). The drawn tile is pinned rightmost by
-            // handDisplayOrder; once delivered to the local player it is stripped
-            // so the rendered hand matches what the player physically holds.
-            List<TheMahjongTile> hand = round.handDisplayOrder(seat);
-            boolean localActive = seat == localSeat
+            // Hand (standing, face-up). Once the drawn tile is delivered to the
+            // local player it is stripped (by value) so the rendered hand matches
+            // what the player physically holds — and the click index maps onto the
+            // same list the server uses (ChineseMahjongTableHumanPlayer.displayHand).
+            boolean drawnDelivered = seat == localSeat && table.drawnTileDeliveredForSeat(seat);
+            List<TheMahjongTile> hand = ChineseMahjongTableHumanPlayer.displayHand(round, seat, drawnDelivered);
+            // 发牌动画：手牌按发出进度逐张揭示（墙阶段为 0 → 无手牌）。
+            if (dealAnim) {
+                int show = (int) Math.round(hand.size() * dealProg[1]);
+                show = Math.max(0, Math.min(hand.size(), show));
+                hand = hand.subList(0, show);
+            }
+            boolean localActive = seat == localSeat && !dealAnim
                     && (round.state() == ChineseRoundState.State.AWAITING_DISCARD
                         || round.state() == ChineseRoundState.State.AWAITING_QUE_YI_MEN)
                     && round.currentTurnSeat() == seat;
-            boolean drawnStripped = false;
-            if (seat == localSeat
-                    && round.state() == ChineseRoundState.State.AWAITING_DISCARD
-                    && round.currentTurnSeat() == seat
-                    && round.lastDrawSeat() == seat
-                    && round.activeTile() != null
-                    && table.drawnTileDeliveredForSeat(seat)) {
-                hand = hand.subList(0, hand.size() - 1);
-                drawnStripped = true;
-            }
+            boolean drawnStripped = hand.size() < round.handDisplayOrder(seat).size();
             // Legal-to-discard tiles for the local player's discard turn.
             java.util.Set<TheMahjongTile> legalDiscards = java.util.Collections.emptySet();
             if (localActive && round.state() == ChineseRoundState.State.AWAITING_DISCARD) {
@@ -730,14 +839,15 @@ public class MahjongTableRenderer implements BlockEntityRenderer<MahjongTableBlo
                     lastHandNode = bm;
                     idx++;
                 }
-                if (highlight.handSeat() == seat && !drawnStripped && lastHandNode != null) {
+                if (!dealAnim && highlight.handSeat() == seat && !drawnStripped && lastHandNode != null) {
                     activeTileNodes.add(lastHandNode);
                 }
                 root.addChild(handGroup);
             }
             // River — grid (cols × rows), same as riichi. The claimed tile during
-            // a discard claim window is the river's last tile.
-            if (!p.discards().isEmpty()) {
+            // a discard claim window is the river's last tile. Hidden during the
+            // deal animation so the opening stays clean.
+            if (!dealAnim && !p.discards().isEmpty()) {
                 GroupNode river = buildGridGroup(RIVER, RIVER.i("cols"), RIVER.i("rows"),
                         p.discards(), outward);
                 if (highlight.riverSeat() == seat) {
@@ -752,16 +862,21 @@ public class MahjongTableRenderer implements BlockEntityRenderer<MahjongTableBlo
                 root.addChild(river);
             }
             // Melds — reuse the riichi meld-stack builder (same meld type).
-            if (!p.melds().isEmpty()) {
+            if (!dealAnim && !p.melds().isEmpty()) {
                 root.addChild(buildMeldsLive(MELDS, p.melds(), outward));
             }
             // Buttons for the local seat, each with a ghost-tile preview of the
             // meld the action would form (claimed tile included) — like riichi.
+            // 定缺按钮（四川开局）即使在发牌动画中也显示——玩家一开局就能选择缺门；
+            // 其余动作按钮在动画结束后才显示。
             if (seat == localSeat) {
-                List<ChinesePlayerAction> buttons = ChineseMahjongTableHumanPlayer.chineseTableButtons(driver, seat);
-                List<List<TheMahjongTile>> ghosts = new java.util.ArrayList<>(buttons.size());
-                for (ChinesePlayerAction a : buttons) ghosts.add(chineseGhostTilesForAction(a, round));
-                buildChineseButtons(root, buttons, ghosts, seat, outward);
+                boolean queYiMen = round.state() == ChineseRoundState.State.AWAITING_QUE_YI_MEN;
+                if (!dealAnim || queYiMen) {
+                    List<ChinesePlayerAction> buttons = ChineseMahjongTableHumanPlayer.chineseTableButtons(driver, seat);
+                    List<List<TheMahjongTile>> ghosts = new java.util.ArrayList<>(buttons.size());
+                    for (ChinesePlayerAction a : buttons) ghosts.add(chineseGhostTilesForAction(a, round));
+                    buildChineseButtons(root, buttons, ghosts, seat, outward);
+                }
             }
             // Wall — fixed face-down ring, consumed from the dealer's wall head
             // (mirrors the riichi wall). Each seat keeps a fixed row of
@@ -771,9 +886,17 @@ public class MahjongTableRenderer implements BlockEntityRenderer<MahjongTableBlo
             int perSeat = Math.max(0, round.initialWallSize() / round.playerCount());
             int seatTiles = chineseLiveTilesAfterDeal(seat, perSeat, round.breakerSeat(),
                     round.initialWallSize() - round.wallSize());
-            if (seatTiles > 0) {
-                int positions = (seatTiles + 1) / 2;   // 2-tall stacks
-                int lastStackLayers = positions > 0 ? seatTiles - (positions - 1) * 2 : -1;
+            int wallTiles = seatTiles;
+            if (dealAnim) {
+                // 墙建造：0 → 满墙；手牌发出：满墙 → 实际余墙（发牌张数被拿走）。
+                wallTiles = dealProg[1] <= 0f
+                        ? (int) Math.round(perSeat * dealProg[0])
+                        : (int) Math.round(perSeat - (perSeat - seatTiles) * dealProg[1]);
+                wallTiles = Math.max(0, Math.min(perSeat, wallTiles));
+            }
+            if (wallTiles > 0) {
+                int positions = (wallTiles + 1) / 2;   // 2-tall stacks
+                int lastStackLayers = positions > 0 ? wallTiles - (positions - 1) * 2 : -1;
                 root.addChild(buildLineGroup(WALL,
                         placeholderTiles(positions, FACE_DOWN_PLACEHOLDER),
                         outward, /* layFlat= */ true,
@@ -832,8 +955,9 @@ public class MahjongTableRenderer implements BlockEntityRenderer<MahjongTableBlo
         if (actions.isEmpty()) return;
         Direction lineDir = outward.getCounterClockWise();
         double[] c = anchorWorldOrigin(BUTTONS, outward);
-        // Larger, padded plates so Chinese labels are readable and clickable.
-        float textScale = 0.012f;
+        // 按钮尺寸：介于立直默认(0.007)与此前过大版(0.012)之间的折中——
+        // 比立直略大便于点击，又不遮挡手牌/桌面。
+        float textScale = 0.0085f;
         Quaternionf rot = baseTileRotation(BUTTONS, outward, true);
 
         // Ghost-tile preview constants (mirror buildButtonsGroup / BUTTON_GHOSTS).
@@ -846,38 +970,46 @@ public class MahjongTableRenderer implements BlockEntityRenderer<MahjongTableBlo
         float rightPadPerTilePx   = BUTTONS.f("rightPadPerTile");
         Direction plateRightDir   = outward.getCounterClockWise();
 
-        // Pass 1 — build all buttons (extraRightPad set) and record plate half-widths.
+        // Pass 1 — build all buttons (extraRightPad set) and record plate
+        // extents. plateHalfWidthWorld() covers the symmetric text+padding
+        // half only; the rendered plate (and ghost-inline area) extends
+        // extraRightPad*textScale further right, so the layout must track
+        // left/right extents separately or a ghost-carrying 碰/杠 button
+        // overlaps its neighbour (e.g. 过).
         int n = actions.size();
         WorldButtonNode[] btns = new WorldButtonNode[n];
-        double[] half = new double[n];
+        double[] left = new double[n];   // centre → left plate edge
+        double[] right = new double[n];  // centre → right plate edge (incl. ghosts pad)
         for (int i = 0; i < n; i++) {
             int ghostCount = (ghosts != null && i < ghosts.size()) ? ghosts.get(i).size() : 0;
             float extraRightPad = rightPadPerTilePx * ghostCount;
             WorldButtonNode btn = new WorldButtonNode(chineseActionLabel(actions.get(i)))
                     .setTextScale(textScale)
-                    .setPlatePadding(9f, 5f)
-                    .setHoverScale(1.15f)
+                    .setPlatePadding(5f, 2f)
+                    .setHoverScale(1.1f)
                     .setHoverBrighten(28)
                     .setExtraRightPad(extraRightPad)   // MUST precede makeClickable
                     .makeClickable(new InteractKey.SeatSlot(
                             (byte) seat, InteractKey.SeatSlot.AREA_BUTTON, (short) i));
             btns[i] = btn;
-            half[i] = btn.plateHalfWidthWorld();
+            left[i] = btn.plateHalfWidthWorld();
+            right[i] = left[i] + extraRightPad * textScale;
         }
 
-        // Pass 2 — lay out left-edge-aligned with a fixed gap between neighbours,
-        // centred on the BUTTONS anchor. Each button centre sits at
-        // cumulativeLeft + its own half-width.
-        double gap = 0.06;
+        // Pass 2 — lay out with a fixed gap between neighbours, centred on the
+        // BUTTONS anchor. Neighbour centre spacing = right[i] + gap + left[i+1]
+        // so full plates (ghost-inline area included) never overlap.
+        double gap = 0.10;
         double total = 0;
-        for (int i = 0; i < n; i++) total += 2 * half[i];
+        for (int i = 0; i < n; i++) total += left[i] + right[i];
         total += gap * (n - 1);
-        double cursor = -total / 2.0;
+        double[] centre = new double[n];
+        centre[0] = -total / 2.0 + left[0];
+        for (int i = 1; i < n; i++) centre[i] = centre[i - 1] + right[i - 1] + gap + left[i];
 
         for (int i = 0; i < n; i++) {
-            double off = cursor + half[i];
-            double x = c[0] + lineDir.getStepX() * off;
-            double z = c[2] + lineDir.getStepZ() * off;
+            double x = c[0] + lineDir.getStepX() * centre[i];
+            double z = c[2] + lineDir.getStepZ() * centre[i];
             WorldButtonNode btn = btns[i];
             btn.transform.setPos(x, c[1], z);
             btn.transform.setRotation(rot);
@@ -910,11 +1042,19 @@ public class MahjongTableRenderer implements BlockEntityRenderer<MahjongTableBlo
                     }
                 }
             }
-            cursor += half[i] + gap + (i + 1 < n ? half[i + 1] : 0);
         }
     }
 
     private static Component chineseActionLabel(ChinesePlayerAction a) {
+        if (a instanceof ChinesePlayerAction.DeclareMissingSuit dm) {
+            String key = switch (dm.missing()) {
+                case MANZU -> "riichi_mahjong_forge.button.action.missing_man";
+                case PINZU -> "riichi_mahjong_forge.button.action.missing_pin";
+                case SOUZU -> "riichi_mahjong_forge.button.action.missing_sou";
+                default -> "riichi_mahjong_forge.button.action.missing_man";
+            };
+            return Component.translatable(key);
+        }
         if (a instanceof ChinesePlayerAction.Ron) return actionLabel("ron");
         if (a instanceof ChinesePlayerAction.Tsumo) return actionLabel("tsumo");
         if (a instanceof ChinesePlayerAction.Pon) return actionLabel("pon");
@@ -1039,11 +1179,13 @@ public class MahjongTableRenderer implements BlockEntityRenderer<MahjongTableBlo
         return Component.translatable("riichi_mahjong_forge.result.round_label", wind, handNum);
     }
 
-    /** 开局仪式浮空：首回合（dice 非零且 drawsSoFar<=1）在桌面中心上方显示
-     *  「庄家 掷出 X+Y=Z · 开门 W」。所有玩家可见（读同步的 round 状态）。 */
+    /** 开局仪式浮空：开局后固定时长（真实时钟，见 {@link #CHINESE_OPENING_NANOS}）
+     *  在桌面中心上方显示「庄家 掷出 X+Y=Z · 开门 W」。所有玩家可见（读同步的
+     *  round 状态）。不再按 drawsSoFar 截断——机器人在 1 秒内就摸完第一张，
+     *  按摸牌数截断会让骰子窗口一闪而过。 */
     private void drawChineseOpeningOverlay(MahjongTableBlockEntity table, ChineseRoundState round,
                                            PoseStack poseStack, MultiBufferSource buffers, int packedLight) {
-        if (round.diceA() <= 0 || round.diceB() <= 0 || round.drawsSoFar() > 1) return;
+        if (round.diceA() <= 0 || round.diceB() <= 0) return;
         int breaker = round.breakerSeat();
         Component wind = Component.translatable("riichi_mahjong_forge.result.wind."
                 + round.seatWind(breaker).name().toLowerCase(java.util.Locale.ROOT));
@@ -1373,7 +1515,7 @@ public class MahjongTableRenderer implements BlockEntityRenderer<MahjongTableBlo
     }
 
     private void resetChineseStaleness() {
-        lastChineseRound = null;
+        lastChineseVersion = -1;
         lastChineseFacing = null;
         lastChineseLocalSeat = -1;
         lastChineseLocalInteractive = false;
@@ -1386,9 +1528,35 @@ public class MahjongTableRenderer implements BlockEntityRenderer<MahjongTableBlo
         lastChineseActiveTile = null;
         lastChineseWallSize = -1;
         lastChineseWinResultsSize = -1;
+        lastChineseHandNumber = -1;
+        chineseOpeningDeadlineNanos = -1L;
+        chineseDealAnimStartNanos = -1L;
+        chineseDealAnimHandNumber = -1;
+        lastChineseAnimWallRevealed = 0;
+        lastChineseAnimHandRevealed = 0;
         java.util.Arrays.fill(lastChineseHandSize, -1);
         java.util.Arrays.fill(lastChineseDiscardSize, -1);
         java.util.Arrays.fill(lastChineseMeldSize, -1);
+    }
+
+    // ── 中文开场发牌动画：进度与判定 ───────────────────────────────────────
+
+    /** 发牌动画进行中？真实时钟判定——动画尚未播完且仍在本局。 */
+    private boolean chineseDealAnimating(ChineseRoundState round) {
+        if (chineseDealAnimStartNanos < 0 || round.handNumber() != chineseDealAnimHandNumber) return false;
+        return System.nanoTime() - chineseDealAnimStartNanos < CHINESE_DEAL_TOTAL_NANOS;
+    }
+
+    /** 当前动画进度：[0]=墙建造 0..1，[1]=手牌发出 0..1（墙阶段为 0）。
+     *  动画结束后两值恒为 1。 */
+    private float[] chineseDealProgress(ChineseRoundState round) {
+        if (!chineseDealAnimating(round)) return new float[]{1f, 1f};
+        long elapsed = System.nanoTime() - chineseDealAnimStartNanos;
+        float wall = elapsed < CHINESE_DEAL_WALL_NANOS
+                ? (float) elapsed / CHINESE_DEAL_WALL_NANOS : 1f;
+        float hand = elapsed < CHINESE_DEAL_WALL_NANOS ? 0f
+                : Math.min(1f, (float) (elapsed - CHINESE_DEAL_WALL_NANOS) / CHINESE_DEAL_HANDS_NANOS);
+        return new float[]{wall, hand};
     }
 
     private void rebuildSceneIfStale(MahjongTableBlockEntity table, Direction facing, boolean editorActive) {

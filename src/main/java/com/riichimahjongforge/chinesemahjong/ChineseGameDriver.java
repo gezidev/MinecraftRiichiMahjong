@@ -24,6 +24,12 @@ public final class ChineseGameDriver {
     private final Random random;
     private ChineseMatchPhase phase;
     private boolean endedFinalized;
+    /** 副露窗口累计等待秒数——超过阈值自动替仍未表态的人类玩家过牌，防止卡局。 */
+    private double claimElapsed;
+    private static final double CLAIM_TIMEOUT_SECONDS = 25.0;
+    /** 定缺累计等待秒数——人类玩家长时间未选缺门则自动选最少花色，防止卡局。 */
+    private double queYiMenElapsed;
+    private static final double QUE_YI_MEN_TIMEOUT_SECONDS = 30.0;
 
     public ChineseGameDriver(ChineseMatch match, List<ChinesePlayerInterface> players, Random random) {
         this.match = match;
@@ -47,6 +53,10 @@ public final class ChineseGameDriver {
     public void restorePhase() {
         syncPhase();
     }
+
+    /** NBT 持久化用：当前局是否已结算终局（查花猪/查大叫），读档避免重复结算。 */
+    public boolean endedFinalized() { return endedFinalized; }
+    public void setEndedFinalized(boolean v) { endedFinalized = v; }
 
     /** One tick. Polls the pending decision and applies it. */
     public void advance(double dt) {
@@ -102,8 +112,11 @@ public final class ChineseGameDriver {
             case AWAITING_DISCARD -> {
                 if (round.currentTurnSeat() != seat) return List.of();
                 List<ChinesePlayerAction> a = new ArrayList<>();
-                ChineseWinResult tsumo = tryTsumo(round, seat);
-                if (tsumo != null) a.add(new ChinesePlayerAction.Tsumo(tsumo));
+                // 自摸仅在真正摸过牌后合法（碰/吃后未摸牌不能自摸）。
+                if (round.lastDrawSeat() == seat) {
+                    ChineseWinResult tsumo = tryTsumo(round, seat);
+                    if (tsumo != null) a.add(new ChinesePlayerAction.Tsumo(tsumo));
+                }
                 List<TheMahjongTile> hand = round.players().get(seat).currentHand();
                 for (TheMahjongTile t : distinct(hand)) {
                     if (forcedMissing(round, seat, t)) continue;
@@ -155,13 +168,18 @@ public final class ChineseGameDriver {
             ChineseWinResult r = tryRon(round, seat, held);
             if (r != null) a.add(new ChinesePlayerAction.Ron(r));
         }
-        List<TheMahjongTile> pon = findNOf(round, seat, held, 2);
-        if (pon != null) a.add(new ChinesePlayerAction.Pon(pon));
-        List<TheMahjongTile> dm = findNOf(round, seat, held, 3);
-        if (dm != null) a.add(new ChinesePlayerAction.Daiminkan(dm));
-        if (round.rules().allowChi() && seat == round.nextActiveAfter(round.claimFromSeat())) {
-            for (List<TheMahjongTile> pair : chiPairs(round, seat, held)) {
-                a.add(new ChinesePlayerAction.Chi(pair));
+        TheMahjongTile.Suit miss = p.missingSuit();
+        boolean blockedByMissing = round.rules().requireQueYiMen()
+                && miss != null && held != null && held.suit() == miss;
+        if (!blockedByMissing) {
+            List<TheMahjongTile> pon = findNOf(round, seat, held, 2);
+            if (pon != null) a.add(new ChinesePlayerAction.Pon(pon));
+            List<TheMahjongTile> dm = findNOf(round, seat, held, 3);
+            if (dm != null) a.add(new ChinesePlayerAction.Daiminkan(dm));
+            if (round.rules().allowChi() && seat == round.nextActiveAfter(round.claimFromSeat())) {
+                for (List<TheMahjongTile> pair : chiPairs(round, seat, held)) {
+                    a.add(new ChinesePlayerAction.Chi(pair));
+                }
             }
         }
         a.add(new ChinesePlayerAction.Pass());
@@ -193,15 +211,17 @@ public final class ChineseGameDriver {
         if (winTile == null && !p.currentHand().isEmpty()) {
             winTile = p.currentHand().get(p.currentHand().size() - 1);
         }
+        boolean kanRob = round.claimKind() == ChineseRoundState.ClaimKind.KAKAN_ROB;
         return new ChineseWinContext(
                 tsumo,
                 seat == round.dealerSeat(),
                 winTile,
                 p.missingSuit(),
-                tsumo ? round.lastDrawWasWallEnd() : round.lastDiscardWasWallEnd(),
+                // 抢杠不是弃牌，不能算河底捞鱼。
+                kanRob ? false : (tsumo ? round.lastDrawWasWallEnd() : round.lastDiscardWasWallEnd()),
                 tsumo && round.afterKanSeat() == seat,
                 !tsumo && round.kanDiscardPending(),
-                round.claimKind() == ChineseRoundState.ClaimKind.KAKAN_ROB,
+                kanRob,
                 seat == round.dealerSeat() && round.drawsSoFar() == 1 && !round.anyDiscardYet(),
                 seat != round.dealerSeat() && round.drawsSoFar() == 2 && !round.anyDiscardYet());
     }
@@ -209,11 +229,40 @@ public final class ChineseGameDriver {
     // ── Poll & apply ─────────────────────────────────────────────────────
 
     private void pollQueYiMen(ChineseRoundState round, double dt) {
+        queYiMenElapsed += dt;
+        boolean timeout = queYiMenElapsed >= QUE_YI_MEN_TIMEOUT_SECONDS;
         for (int s = 0; s < players.size(); s++) {
             if (round.players().get(s).missingSuit() != null) continue;
+            if (timeout) {
+                // 兜底：超时仍未定缺（人类挂机）则自动选最少花色，防止整局卡死。
+                applyAction(round, s, autoMissing(round, s));
+                syncPhase();
+                if (round.state() != ChineseRoundState.State.AWAITING_QUE_YI_MEN) return;
+                continue;
+            }
             pollSingle(round, dt, s);
             if (round.state() != ChineseRoundState.State.AWAITING_QUE_YI_MEN) return;
         }
+        if (round.state() != ChineseRoundState.State.AWAITING_QUE_YI_MEN) queYiMenElapsed = 0;
+    }
+
+    /** 超时兜底：自动选手牌最少的花色作为缺门（与机器人策略一致）。 */
+    private static ChinesePlayerAction autoMissing(ChineseRoundState round, int seat) {
+        List<TheMahjongTile> hand = round.players().get(seat).currentHand();
+        int man = 0, pin = 0, sou = 0;
+        for (TheMahjongTile t : hand) {
+            switch (t.suit()) {
+                case MANZU -> man++;
+                case PINZU -> pin++;
+                case SOUZU -> sou++;
+                default -> {}
+            }
+        }
+        TheMahjongTile.Suit miss;
+        if (man <= pin && man <= sou) miss = TheMahjongTile.Suit.MANZU;
+        else if (pin <= sou) miss = TheMahjongTile.Suit.PINZU;
+        else miss = TheMahjongTile.Suit.SOUZU;
+        return new ChinesePlayerAction.DeclareMissingSuit(miss);
     }
 
     private void pollSingle(ChineseRoundState round, double dt, int seat) {
@@ -262,6 +311,8 @@ public final class ChineseGameDriver {
 
     private void pollClaims(ChineseRoundState round, double dt) {
         List<Integer> pending = eligibleClaimSeats(round);
+        claimElapsed += dt;
+        boolean timeout = claimElapsed >= CLAIM_TIMEOUT_SECONDS;
         Map<Integer, ChinesePlayerAction> decisions = new HashMap<>();
         for (int s : pending) {
             List<ChinesePlayerAction> legal = claimActions(round, s);
@@ -275,11 +326,17 @@ public final class ChineseGameDriver {
                 decisions.put(s, new ChinesePlayerAction.Pass());
                 continue;
             }
+            if (timeout) {
+                // 超时兜底：人类玩家未表态则自动过，避免卡局。
+                decisions.put(s, new ChinesePlayerAction.Pass());
+                continue;
+            }
             ChineseDecisionRequest req = new ChineseDecisionRequest(s, phase, legal, round, round.rules());
             Optional<ChinesePlayerAction> chosen = players.get(s).chooseAction(req, dt);
             if (chosen.isEmpty()) return; // wait for the deciding player
             decisions.put(s, legal.contains(chosen.get()) ? chosen.get() : new ChinesePlayerAction.Pass());
         }
+        claimElapsed = 0;
         resolveClaims(round, decisions, pending);
         syncPhase();
     }
@@ -344,6 +401,7 @@ public final class ChineseGameDriver {
     public void advanceRound() {
         if (match.advanceRound(random)) {
             endedFinalized = false;
+            queYiMenElapsed = 0; // 新局定缺计时清零，避免沿用上一局超时立即自动选
             syncPhase();
             for (ChinesePlayerInterface p : players) p.onEvent(new ChineseMatchEvent.RoundStarted());
         } else {
@@ -369,7 +427,13 @@ public final class ChineseGameDriver {
             case CLAIM_WINDOW -> phase = new ChineseMatchPhase.AwaitingClaims(
                     eligibleClaimSeats(round), round.activeTile(),
                     round.claimKind() == ChineseRoundState.ClaimKind.KAKAN_ROB);
-            case ENDED -> { /* finalizeEnded sets RoundEnded */ }
+            case ENDED -> {
+                // Round already finalized → expose RoundEnded directly instead of
+                // letting finalizeEnded re-run (which would re-settle 查花猪/查大叫).
+                if (endedFinalized) {
+                    phase = new ChineseMatchPhase.RoundEnded(round.winResults());
+                }
+            }
             default -> {}
         }
     }
@@ -380,7 +444,8 @@ public final class ChineseGameDriver {
         Set<Long> seen = new LinkedHashSet<>();
         List<TheMahjongTile> out = new ArrayList<>();
         for (TheMahjongTile t : tiles) {
-            long key = (long) t.suit().ordinal() * 100 + t.rank();
+            // 区分红五与普通五（中式牌组无赤宝，但防御性处理）。
+            long key = (long) t.suit().ordinal() * 1000 + t.rank() * 10 + (t.redDora() ? 1 : 0);
             if (seen.add(key)) out.add(t);
         }
         return out;

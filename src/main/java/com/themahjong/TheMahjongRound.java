@@ -600,6 +600,17 @@ public final class TheMahjongRound {
             throw new IllegalStateException("discard() requires state TURN, was " + state);
         }
         TheMahjongPlayer discardingPlayer = players.get(currentTurnSeat);
+        // 立直已宣告后，只能打出刚摸的那张牌（WRC/Tenhou 规则），防止改变听牌。
+        boolean alreadyRiichi = discardingPlayer.riichi()
+                && discardingPlayer.discards().stream().anyMatch(TheMahjongDiscard::riichiDeclared);
+        if (alreadyRiichi) {
+            boolean isDrawn = activeTile instanceof ActiveTile.Drawn drawn
+                    && tile.matchesSuitRank(drawn.tile());
+            if (!isDrawn) {
+                throw new IllegalStateException(
+                        "riichi player must discard the just-drawn tile, was " + tile);
+            }
+        }
         List<TheMahjongTile> newHand = new ArrayList<>(discardingPlayer.currentHand());
         int index = newHand.indexOf(tile);
         if (index == -1) {

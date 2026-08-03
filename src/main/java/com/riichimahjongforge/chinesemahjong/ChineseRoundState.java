@@ -44,8 +44,10 @@ public final class ChineseRoundState {
     /** 开局两颗骰子（1-6）。0 = legacy/无骰（发牌不跳牌）。 */
     private final int diceA;
     private final int diceB;
-    /** 整局初始牌墙张数（136 等），供渲染端按固定位置显示消耗。 */
-    private final int initialWallSize;
+    /** 整局初始牌墙张数（136 等），供渲染端按固定位置显示消耗。
+     *  发牌前的完整墙张数；客户端 NBT 恢复时必须显式还原（否则按余墙反推
+     *  会恒等于 13*N+1，导致 taken=0、牌墙在客户端看起来永不消耗）。 */
+    private int initialWallSize;
 
     private final List<TheMahjongTile> wall;
     private final List<ChinesePlayerState> players;
@@ -323,7 +325,15 @@ public final class ChineseRoundState {
 
     private void removeActiveFromRiver() {
         if (activeTile != null && claimFromSeat >= 0 && claimFromSeat < playerCount) {
-            players.get(claimFromSeat).discards().remove(activeTile);
+            List<TheMahjongTile> discards = players.get(claimFromSeat).discards();
+            // 刚打出的牌总是在弃牌末尾；remove(Object) 会删第一个同名项，
+            // 若此前弃过同值牌会删错，必须删末尾。
+            for (int i = discards.size() - 1; i >= 0; i--) {
+                if (discards.get(i).matchesSuitRank(activeTile)) {
+                    discards.remove(i);
+                    break;
+                }
+            }
         }
     }
 
@@ -344,6 +354,37 @@ public final class ChineseRoundState {
         winResults.add(result);
         if (tsumo && afterKanSeat == winner) {
             afterKanSeat = -1; // 杠上花已结算
+        }
+        // 荣和/抢杠后，出牌者（或被抢者）的杠后状态清空，防止隔一轮误判杠上炮。
+        if (!tsumo && afterKanSeat == fromSeat) {
+            afterKanSeat = -1;
+        }
+
+        // 抢杠胡：加杠被抢，加杠无效——还原为碰、返还补杠（下雨）分差。
+        if (claimKind == ClaimKind.KAKAN_ROB && kanRobSeat >= 0 && kanRobSeat < playerCount) {
+            ChinesePlayerState kp = players.get(kanRobSeat);
+            if (kanRobPon != null) {
+                List<TheMahjongMeld> toReplace = new ArrayList<>();
+                for (TheMahjongMeld m : kp.melds()) {
+                    if (m instanceof TheMahjongMeld.Kakan kakan
+                            && kakan.upgradedFrom().tiles().get(0).matchesSuitRank(kanRobPon.tiles().get(0))) {
+                        toReplace.add(m);
+                    }
+                }
+                for (TheMahjongMeld m : toReplace) {
+                    kp.removeMeld(m);
+                    kp.addMeld(kanRobPon);
+                }
+            }
+            if (rules.gangImmediate()) {
+                List<Integer> gang = ChineseScoring.gangDeltas(
+                        ChineseScoring.GangKind.BU_GANG, kanRobSeat, -1, playerCount, rules);
+                for (int s = 0; s < playerCount; s++) players.get(s).addPoints(-gang.get(s));
+            }
+            if (afterKanSeat == kanRobSeat) afterKanSeat = -1;
+            kanRobSeat = -1;
+            kanRobPon = null;
+            kanRobAdded = null;
         }
 
         if (rules.singleWinEndsRound()) {
@@ -418,17 +459,36 @@ public final class ChineseRoundState {
 
     private boolean hasJiao(int seat) {
         ChinesePlayerState p = players.get(seat);
-        return !ChineseWinForms.winningTiles(p.currentHand(), p.melds(), rules).isEmpty();
+        // 缺一门门槛：听牌候选中剔除缺门花色（四川定缺）。
+        ChineseRules r = rules;
+        TheMahjongTile.Suit miss = p.missingSuit();
+        for (TheMahjongTile cand : ChineseWinForms.winningTiles(p.currentHand(), p.melds(), r)) {
+            if (r.requireQueYiMen() && miss != null && cand.suit() == miss) continue;
+            return true;
+        }
+        return false;
     }
 
     private boolean isHuaZhu(int seat) {
         boolean man = false, pin = false, sou = false;
-        for (TheMahjongTile t : players.get(seat).currentHand()) {
+        ChinesePlayerState p = players.get(seat);
+        for (TheMahjongTile t : p.currentHand()) {
             switch (t.suit()) {
                 case MANZU -> man = true;
                 case PINZU -> pin = true;
                 case SOUZU -> sou = true;
                 default -> {}
+            }
+        }
+        // 副露也算——碰/杠了缺门花色同样构成花猪。
+        for (TheMahjongMeld m : p.melds()) {
+            for (TheMahjongTile t : m.tiles()) {
+                switch (t.suit()) {
+                    case MANZU -> man = true;
+                    case PINZU -> pin = true;
+                    case SOUZU -> sou = true;
+                    default -> {}
+                }
             }
         }
         return man && pin && sou;
@@ -438,6 +498,16 @@ public final class ChineseRoundState {
     public int kanRobSeat() { return kanRobSeat; }
     public TheMahjongMeld.Pon kanRobPon() { return kanRobPon; }
     public TheMahjongTile kanRobAdded() { return kanRobAdded; }
+
+    /** NBT 恢复补充：claim 窗口与杠后状态（restore 主签名不含这些，避免参数爆炸）。 */
+    public void restoreClaimWindow(ClaimKind kind, int kanRobSeat, TheMahjongMeld.Pon kanRobPon,
+                                   TheMahjongTile kanRobAdded, int afterKanSeat) {
+        this.claimKind = kind != null ? kind : ClaimKind.NONE;
+        this.kanRobSeat = kanRobSeat;
+        this.kanRobPon = kanRobPon;
+        this.kanRobAdded = kanRobAdded;
+        this.afterKanSeat = afterKanSeat;
+    }
 
     /**
      * Sorted hand for display/click consistency. Mirrors riichi: when this seat
@@ -489,6 +559,18 @@ public final class ChineseRoundState {
         r.winResults.clear();
         r.winResults.addAll(winResults);
         return r;
+    }
+
+    /** NBT 恢复补充：写回服务器侧的 version 计数器，客户端据此判断是否重建场景。 */
+    public void restoreVersion(int v) {
+        this.version = v;
+    }
+
+    /** NBT 恢复补充：还原发牌前的完整牌墙张数（服务器持久化的初始值）。
+     *  不还原的话，客户端按 {@code 13*N+1 + 余墙} 反推会在对局中途恒等于
+     *  {@code 13*N+1}，使渲染端认为墙没有任何消耗。 */
+    public void restoreInitialWallSize(int v) {
+        this.initialWallSize = v;
     }
 
     private ChineseRoundState(int playerCount, int dealerSeat, TheMahjongTile.Wind roundWind,

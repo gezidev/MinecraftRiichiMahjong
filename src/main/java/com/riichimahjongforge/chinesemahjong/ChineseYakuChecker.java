@@ -40,7 +40,8 @@ public final class ChineseYakuChecker {
             ChineseRules rules,
             int winnerSeat, int fromSeat, int playerCount, int dealerSeat) {
 
-        if (ctx.missingSuit() != null && containsSuit(concealed, ctx.missingSuit())) {
+        if (ctx.missingSuit() != null
+                && (containsSuit(concealed, ctx.missingSuit()) || meldsContainSuit(melds, ctx.missingSuit()))) {
             return Optional.empty(); // 缺一门 gate failed
         }
 
@@ -108,7 +109,9 @@ public final class ChineseYakuChecker {
                 fan += rules.fanOf(ChineseYaku.YAO_JIU);
             }
             // Full-win standard hands
-            if (rules.fanTable().containsKey(ChineseYaku.SI_AN_KE) && allTrip && s.closed()) {
+            // 四暗刻需自摸（荣和补刻子的 shanpon 不算；单骑荣和此处按简化规则也不计）。
+            if (rules.fanTable().containsKey(ChineseYaku.SI_AN_KE)
+                    && allTrip && s.closed() && ctx.tsumo()) {
                 yaku.add(ChineseYaku.SI_AN_KE);
                 fan += rules.fanOf(ChineseYaku.SI_AN_KE);
                 fullWin = true;
@@ -289,6 +292,13 @@ public final class ChineseYakuChecker {
 
     private static boolean containsSuit(List<TheMahjongTile> tiles, TheMahjongTile.Suit suit) {
         for (TheMahjongTile t : tiles) if (t.suit() == suit) return true;
+        return false;
+    }
+
+    private static boolean meldsContainSuit(List<TheMahjongMeld> melds, TheMahjongTile.Suit suit) {
+        for (TheMahjongMeld m : melds) {
+            for (TheMahjongTile t : m.tiles()) if (t.suit() == suit) return true;
+        }
         return false;
     }
 }

@@ -321,6 +321,11 @@ public final class TheMahjongDriver {
             broadcast(new MatchEvent.RiichiDeclared(seat));
             round = round.discard(d.tile(), rules());
             match = matchWithRound(round);
+            // 四家立直（第4家宣告立直后）→ 流局。
+            if (rules().abortiveDrawsAllowed() && round.isSuuchaRiichi()) {
+                abortiveDrawAndEnd();
+                return;
+            }
             lastDrawWasRinshan = false;
             pendingRiichiCommit = OptionalInt.of(seat);
             broadcast(new MatchEvent.Discarded(seat, d.tile(), true));
@@ -329,11 +334,20 @@ public final class TheMahjongDriver {
             round = round.declareAnkan(a.handTiles(), rules());
             match = matchWithRound(round);
             broadcast(new MatchEvent.MeldDeclared(seat, lastMeldOf(seat)));
+            // 四杠散了（多人累计4杠且非一人独杠）→ 流局。
+            if (rules().abortiveDrawsAllowed() && round.isSuukanSanra()) {
+                abortiveDrawAndEnd();
+                return;
+            }
             phase = new MatchPhase.AwaitingDraw(seat, true);
         } else if (action instanceof PlayerAction.Kakan k) {
             round = round.declareKakan(k.upgradedFrom(), k.addedTile(), rules());
             match = matchWithRound(round);
             broadcast(new MatchEvent.MeldDeclared(seat, lastMeldOf(seat)));
+            if (rules().abortiveDrawsAllowed() && round.isSuukanSanra()) {
+                abortiveDrawAndEnd();
+                return;
+            }
             enterPostKakanPhase();
         } else if (action instanceof PlayerAction.DeclareKita k) {
             round = round.declareKita(k.tile());
@@ -363,6 +377,11 @@ public final class TheMahjongDriver {
             phase = new MatchPhase.RoundEnded(List.of());
             return;
         }
+        // 四风连打（四家首打同一风牌）→ 流局。
+        if (rules().abortiveDrawsAllowed() && round.isSuufonRenta()) {
+            abortiveDrawAndEnd();
+            return;
+        }
         TheMahjongTile held = ((TheMahjongRound.ActiveTile.HeldDiscard) round.activeTile()).tile();
         Set<Integer> pending = computeClaimEligibleSeats(held, MatchPhase.ClaimSource.DISCARD);
         if (pending.isEmpty()) {
@@ -371,6 +390,14 @@ public final class TheMahjongDriver {
             claimDecisions.clear();
             phase = new MatchPhase.AwaitingClaims(pending, held, MatchPhase.ClaimSource.DISCARD);
         }
+    }
+
+    /** 触发中止流局（四家立直/四风连打/四杠散了等）。 */
+    private void abortiveDrawAndEnd() {
+        TheMahjongRound round = currentRound();
+        match = matchWithRound(round.abortiveDraw(rules()));
+        phase = new MatchPhase.RoundEnded(List.of());
+        broadcast(new MatchEvent.RoundEnded(List.of()));
     }
 
     private void enterPostKitaPhase() {
@@ -447,6 +474,10 @@ public final class TheMahjongDriver {
                 TheMahjongRound updated = round.claimDaiminkan(s, k.handTiles(), rules());
                 match = matchWithRound(updated);
                 broadcast(new MatchEvent.MeldDeclared(s, lastMeldOf(s)));
+                if (rules().abortiveDrawsAllowed() && updated.isSuukanSanra()) {
+                    abortiveDrawAndEnd();
+                    return;
+                }
                 claimDecisions.clear();
                 phase = new MatchPhase.AwaitingDraw(s, true);
                 return;
@@ -553,8 +584,14 @@ public final class TheMahjongDriver {
         WinResult first = ronResultOf(claimDecisions.get(ronSeats.get(0)));
         round = round.beginRon(ronSeats.get(0), first, rules());
         results.add(first);
+        int sticks = round.riichiSticks();
         for (int i = 1; i < ronSeats.size(); i++) {
             WinResult wr = ronResultOf(claimDecisions.get(ronSeats.get(i)));
+            if (sticks > 0) {
+                // 多荣和时立直棒只归最近一家（首个赢家）。后续赢家的预计算分差
+                // 里已含整份棒值，这里把它剔除，避免放铳者重复支付、凭空多分。
+                wr = stripRiichiSticks(wr, sticks, ronSeats.get(i), discarder);
+            }
             round = round.addRon(ronSeats.get(i), wr);
             results.add(wr);
         }
@@ -563,6 +600,14 @@ public final class TheMahjongDriver {
         claimDecisions.clear();
         phase = new MatchPhase.RoundEnded(List.copyOf(results));
         broadcast(new MatchEvent.RoundEnded(List.copyOf(results)));
+    }
+
+    /** 从后续赢家的分差中移除立直棒转移：赢家少收 sticks×1000，放铳者少付同额。 */
+    private static WinResult stripRiichiSticks(WinResult wr, int sticks, int winner, int discarder) {
+        List<Integer> d = new ArrayList<>(wr.pointDeltas());
+        if (winner >= 0 && winner < d.size()) d.set(winner, d.get(winner) - sticks * 1000);
+        if (discarder >= 0 && discarder < d.size()) d.set(discarder, d.get(discarder) + sticks * 1000);
+        return new WinResult(wr.yaku(), wr.yakuman(), wr.han(), wr.fu(), wr.doraCount(), List.copyOf(d));
     }
 
     private void checkExhaustiveDraw(TheMahjongRound round) {

@@ -23,14 +23,14 @@ public abstract class ChineseAbstractBot implements ChinesePlayerInterface {
 
     protected double secondsFor(ChineseDecisionRequest request) {
         for (ChinesePlayerAction a : request.legalActions()) {
-            if (a instanceof ChinesePlayerAction.Tsumo || a instanceof ChinesePlayerAction.Ron) return 0.35;
+            if (a instanceof ChinesePlayerAction.Tsumo || a instanceof ChinesePlayerAction.Ron) return 0.10;
             if (a instanceof ChinesePlayerAction.Pon
                     || a instanceof ChinesePlayerAction.Chi
-                    || a instanceof ChinesePlayerAction.Daiminkan) return 0.25;
-            if (a instanceof ChinesePlayerAction.Discard) return 0.15;
-            if (a instanceof ChinesePlayerAction.Draw) return 0.05;
+                    || a instanceof ChinesePlayerAction.Daiminkan) return 0.08;
+            if (a instanceof ChinesePlayerAction.Discard) return 0.05;
+            if (a instanceof ChinesePlayerAction.Draw) return 0.02;
         }
-        return 0.05;
+        return 0.02;
     }
 
     /** 定缺：选手中最少的一门花色作为缺门。 */
